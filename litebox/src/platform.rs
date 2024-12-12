@@ -8,6 +8,10 @@ use either::Either;
 use thiserror::Error;
 
 /// A provider of a platform upon which LiteBox can execute.
+///
+/// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
+/// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
+/// allow storage of any useful "globals" within it necessary.
 pub trait Provider: RawMutexProvider + IPInterfaceProvider + PunchthroughProvider {}
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
