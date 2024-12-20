@@ -13,7 +13,12 @@ use thiserror::Error;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + IPInterfaceProvider + TimeProvider + PunchthroughProvider + 'static
+    RawMutexProvider
+    + IPInterfaceProvider
+    + TimeProvider
+    + PunchthroughProvider
+    + DebugLogProvider
+    + 'static
 {
 }
 
@@ -181,6 +186,20 @@ pub trait Instant {
         self.checked_duration_since(earlier)
             .unwrap_or(core::time::Duration::from_secs(0))
     }
+}
+
+/// An interface to dumping debug output for tracing purposes.
+pub trait DebugLogProvider {
+    /// Print `msg` to the debug log
+    ///
+    /// Newlines are *not* automatically appended to `msg`, thus the caller must make sure to
+    /// include newlines if necessary.
+    ///
+    /// One some platforms, this might be a slow/expensive operation, thus ideally callers of this
+    /// should prefer not making a large number of small prints to print a single logical message,
+    /// but instead should combine all strings part of a single logical message into a single
+    /// `debug_log_print` call.
+    fn debug_log_print(&self, msg: &str);
 }
 
 /// Implementations of trivial providers.
