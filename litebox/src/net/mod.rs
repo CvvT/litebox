@@ -7,6 +7,7 @@ use crate::platform;
 use bitflags::bitflags;
 use thiserror::Error;
 
+mod local_ports;
 mod phy;
 mod sockets;
 
@@ -28,7 +29,7 @@ pub enum NetError {
     #[error("Not a valid open file descriptor")]
     InvalidFd,
     #[error("Port allocation failed: {0}")]
-    PortAllocationFailure(#[from] sockets::LocalPortAllocationError),
+    PortAllocationFailure(#[from] local_ports::LocalPortAllocationError),
     #[error("Socket is in an invalid state")]
     SocketInInvalidState,
     #[error("Operation finished")]
