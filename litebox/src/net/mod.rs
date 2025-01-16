@@ -15,6 +15,9 @@ pub mod errors;
 mod local_ports;
 mod phy;
 
+#[cfg(test)]
+mod tests;
+
 use errors::{
     AcceptError, BindError, CloseError, ConnectError, ListenError, ReceiveError, SendError,
     SocketError,
