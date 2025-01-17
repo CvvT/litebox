@@ -111,7 +111,7 @@ impl<'platform, Platform: platform::IPInterfaceProvider + platform::TimeProvider
 }
 
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
-/// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Sockets::socket_set`].
+/// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
 struct SocketHandle {
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,

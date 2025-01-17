@@ -12,8 +12,8 @@ use core::marker::PhantomData;
 
 use super::RawSyncPrimitivesProvider;
 
-/// A spin-enabled wrapper around [`platform::RawMutex`] to reduce the number of unnecessary calls
-/// out to platform.
+/// A spin-enabled wrapper around [`platform::RawMutex`](crate::platform::RawMutex) to reduce the
+/// number of unnecessary calls out to platform.
 struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
     /// 1: locked, no other threads waiting
@@ -22,7 +22,7 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
-    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](Platform::RawMutex).
+    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
     #[inline]
     fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
