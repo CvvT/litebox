@@ -8,11 +8,6 @@ use super::FileSystem;
 
 use thiserror::Error;
 
-/// Possible errors from [`FileSystem::foo`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum FooError {}
-
 /// Possible errors from [`FileSystem::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
