@@ -28,7 +28,7 @@ mod private {
 /// A `FileSystem` provides access to all file-system related functionality provided by LiteBox.
 ///
 /// The design of the file-system is chosen by the specific underlying implementation of this trait
-/// (i.e., [`InMemoryFileSystem`] or [`NinePFileSystem`]), each of which are parametric in the
+/// (i.e., [`in_mem::FileSystem`] or [`nine_p::FileSystem`]), each of which are parametric in the
 /// platform they run on. However, users of any of these file systems might find benefit in having
 /// most of their code depend on this trait, rather than on any individual file system.
 pub trait FileSystem: private::Sealed {

@@ -2,14 +2,15 @@
 
 use crate::platform;
 
-/// A backing implementation for [`FileSystem`] using a 9p-based network file system.
+/// A backing implementation for [`FileSystem`](super::FileSystem) using a 9p-based network file
+/// system.
 // TODO(jayb): Reduce the requirements necessary on `Platform` to the most precise one possible.
-pub struct NinePFileSystem<'platform, Platform: platform::Provider> {
+pub struct FileSystem<'platform, Platform: platform::Provider> {
     platform: &'platform Platform,
 }
 
-impl<'platform, Platform: platform::Provider> NinePFileSystem<'platform, Platform> {
-    /// Construct a new `NinePFileSystem` instance
+impl<'platform, Platform: platform::Provider> FileSystem<'platform, Platform> {
+    /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialiation step,
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
@@ -20,9 +21,9 @@ impl<'platform, Platform: platform::Provider> NinePFileSystem<'platform, Platfor
     }
 }
 
-impl<Platform: platform::Provider> super::private::Sealed for NinePFileSystem<'_, Platform> {}
+impl<Platform: platform::Provider> super::private::Sealed for FileSystem<'_, Platform> {}
 
-impl<Platform: platform::Provider> super::FileSystem for NinePFileSystem<'_, Platform> {
+impl<Platform: platform::Provider> super::FileSystem for FileSystem<'_, Platform> {
     fn open(
         &self,
         path: impl crate::path::Arg,

@@ -13,8 +13,25 @@ pub enum ConversionError {
 
 type Result<T> = core::result::Result<T, ConversionError>;
 
+/// A private module, to help support writing sealed traits. This module should _itself_ never be
+/// made public.
+mod private {
+    /// A trait to help seal the main `Arg` trait.
+    ///
+    /// This trait is explicitly public, but unnameable, thereby preventing code outside this crate
+    /// from implementing this trait.
+    pub trait Sealed {}
+
+    impl Sealed for &str {}
+    impl Sealed for alloc::string::String {}
+    impl Sealed for &core::ffi::CStr {}
+    impl Sealed for alloc::ffi::CString {}
+    impl Sealed for alloc::borrow::Cow<'_, str> {}
+    impl Sealed for alloc::borrow::Cow<'_, core::ffi::CStr> {}
+}
+
 /// Trait for passing path arguments
-pub trait Arg {
+pub trait Arg: private::Sealed {
     /// Convert to a null-terminated string
     ///
     /// If the contents are a valid C string, returns a borrowed string (cheap), otherwise returns a
@@ -29,6 +46,56 @@ pub trait Arg {
     // If the contents are a valid UTF-8 string, returns a borrowed string (cheap), otherwise
     // returns a copied owned string (costs roughly a memcpy).
     fn to_rust_str_lossy(&self) -> Cow<str>;
+
+    /// Separate the path into components
+    ///
+    /// This simply splits the path into components. Thus each component is guaranteed to not have a
+    /// `/` anymore. This does not perform any normalization, thus getting the components of
+    /// `foo/../bar` would give `foo`, `..`, and `bar`.
+    fn components(&self) -> Result<impl Iterator<Item = &str>> {
+        Ok(self.as_rust_str()?.split('/'))
+    }
+
+    /// Normalize the path and separate into components
+    ///
+    /// This is similar to [`Self::components`] except with normalization. Look at the tests for
+    /// details on normalization.
+    fn normalized_components(&self) -> Result<impl Iterator<Item = &str>> {
+        let mut drop_rest = false;
+        let mut parent_count = 0;
+        let mut rev_norm_components = self
+            .as_rust_str()?
+            .rsplit('/')
+            .filter(|&component| {
+                !drop_rest
+                    && match component {
+                        "" => {
+                            drop_rest = true;
+                            false
+                        }
+                        "." => false,
+                        ".." => {
+                            parent_count += 1;
+                            false
+                        }
+                        _ if parent_count > 0 => {
+                            parent_count -= 1;
+                            false
+                        }
+                        _ => true,
+                    }
+            })
+            .collect::<alloc::vec::Vec<_>>();
+        rev_norm_components.extend(core::iter::repeat_n("..", parent_count));
+        Ok(rev_norm_components.into_iter().rev())
+    }
+
+    /// Convenience wrapper around [`Self::normalized_components`]
+    fn normalized(&self) -> Result<String> {
+        let mut res = alloc::vec![];
+        res.extend(self.normalized_components()?);
+        Ok(res.join("/"))
+    }
 }
 
 impl Arg for &str {
@@ -63,7 +130,7 @@ impl Arg for String {
     }
 }
 
-impl Arg for CStr {
+impl Arg for &CStr {
     fn to_c_str(&self) -> Result<Cow<CStr>> {
         Ok(Cow::Borrowed(self))
     }
@@ -132,5 +199,30 @@ impl Arg for Cow<'_, CStr> {
             Cow::Borrowed(s) => s.to_rust_str_lossy(),
             Cow::Owned(s) => s.to_rust_str_lossy(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::path::Arg;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn path_normalization() {
+        assert_eq!(
+            "../foo/../bar/./baz"
+                .normalized_components()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["..", "bar", "baz"],
+        );
+        assert_eq!(
+            "../foo/../bar//./baz"
+                .normalized_components()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["baz"],
+        );
     }
 }
