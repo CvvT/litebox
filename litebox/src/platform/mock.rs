@@ -36,11 +36,13 @@ impl MockPlatform {
 
 impl Provider for MockPlatform {}
 
-pub(crate) struct MockRawMutex {}
+pub(crate) struct MockRawMutex {
+    atomic: core::sync::atomic::AtomicU32,
+}
 
 impl RawMutex for MockRawMutex {
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
-        unimplemented!("raw mutex for MockPlatform")
+        &self.atomic
     }
 
     fn wake_many(&self, n: usize) -> usize {
@@ -64,7 +66,9 @@ impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
-        unimplemented!("raw mutex for MockPlatform")
+        MockRawMutex {
+            atomic: core::sync::atomic::AtomicU32::new(0),
+        }
     }
 }
 

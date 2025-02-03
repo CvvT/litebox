@@ -79,6 +79,9 @@ pub trait Arg: private::Sealed {
             })
             .collect::<alloc::vec::Vec<_>>();
         rev_norm_components.extend(core::iter::repeat_n("..", parent_count));
+        if self.as_rust_str()?.starts_with('/') {
+            rev_norm_components.push("");
+        }
         Ok(rev_norm_components.into_iter().rev())
     }
 

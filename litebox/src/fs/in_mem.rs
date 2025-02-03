@@ -55,6 +55,23 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform,
             descriptors,
         }
     }
+
+    /// Execute `f` with superuser/root privileges.
+    ///
+    /// This function primarily exists to initialize files. Most regular interaction with the file
+    /// system should be done without this function.
+    pub fn with_root_privileges<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        const ROOT: UserInfo = UserInfo { user: 0, group: 0 };
+        let original_user = core::mem::replace(&mut self.current_user, ROOT);
+        f(self);
+        let root_again = core::mem::replace(&mut self.current_user, original_user);
+        if root_again.user != ROOT.user || root_again.group != ROOT.group {
+            unreachable!()
+        }
+    }
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed
@@ -354,7 +371,7 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Pl
                 String::new(),
                 Entry::Dir(Arc::new(sync.new_rwlock(DirX {
                     perms: Permissions {
-                        mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::WOTH,
+                        mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
                     children_count: 0,
@@ -439,13 +456,13 @@ struct FileX {
     data: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct UserInfo {
     user: u16,
     group: u16,
@@ -533,9 +550,9 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> Descriptors<'platform
     }
 
     fn remove(&mut self, mut fd: FileFd) {
-        fd.x.mark_as_closed();
         let old = self.descriptors[fd.x.as_usize()].take();
         assert!(old.is_some());
+        fd.x.mark_as_closed();
     }
 
     fn get(&self, fd: &FileFd) -> &Descriptor<'platform, Platform> {

@@ -11,6 +11,9 @@ pub mod errors;
 pub mod in_mem;
 pub mod nine_p;
 
+#[cfg(test)]
+mod tests;
+
 use errors::{
     ChmodError, CloseError, MkdirError, OpenError, ReadError, RmdirError, UnlinkError, WriteError,
 };
