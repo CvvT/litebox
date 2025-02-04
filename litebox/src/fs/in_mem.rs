@@ -407,7 +407,12 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Pl
                 (_, Entry::File(_)) => return Err(PathError::ComponentNotADirectory),
                 (parent_path, Entry::Dir(dir)) => {
                     if !current_user.can_execute(&dir.read().perms) {
-                        return Err(PathError::NoSearchPerms);
+                        return Err(PathError::NoSearchPerms {
+                            #[cfg(debug_assertions)]
+                            dir: parent_path.clone(),
+                            #[cfg(debug_assertions)]
+                            perms: dir.read().perms.mode,
+                        });
                     }
                     parent_dir = Some((parent_path.as_str(), dir.clone()));
                 }
