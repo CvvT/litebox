@@ -703,7 +703,10 @@ fn get_shm_info_from_optee_msg_param_tmem(
     let aligned_addr = phys_addr - page_offset as u64;
 
     // Calculate number of pages needed
-    let num_pages = (page_offset + size).div_ceil(PAGE_SIZE);
+    let num_pages = page_offset
+        .checked_add(size)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?
+        .div_ceil(PAGE_SIZE);
 
     // Build page address list
     let mut page_addrs = Vec::with_capacity(num_pages);
