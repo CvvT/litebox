@@ -1147,7 +1147,7 @@ pub(crate) fn write_sockaddr_to_user(
                 }
                 UnixSocketAddr::Path(path) => {
                     let offset = offset_of!(CSockUnixAddr, path);
-                    let max_len = addrlen_val as usize - offset;
+                    let max_len = (addrlen_val as usize).saturating_sub(offset);
                     let name = &path.as_bytes()[..path.len().min(max_len)];
                     addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name)
                         .ok_or(Errno::EFAULT)?;
