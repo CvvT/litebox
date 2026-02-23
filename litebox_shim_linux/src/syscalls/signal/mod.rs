@@ -263,7 +263,7 @@ fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
         return false;
     }
     let stack_start = stack.sp;
-    let stack_end = stack.sp.wrapping_add(stack.size);
+    let stack_end = stack.sp + stack.size;
     sp >= stack_start && sp < stack_end
 }
 
@@ -350,7 +350,7 @@ impl SignalState {
             && !on_alt_stack
             && !altstack.flags.contains(SsFlags::DISABLE);
         let sp = if switch_stacks {
-            altstack.sp.wrapping_add(altstack.size)
+            altstack.sp + altstack.size
         } else {
             sp
         };
