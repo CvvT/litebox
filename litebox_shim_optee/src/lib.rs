@@ -80,19 +80,19 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
             };
             if info.kernel_mode {
                 return if result.is_ok() {
-                    ContinueOperation::ResumeKernelPlatform
+                    ContinueOperation::Resume
                 } else {
-                    ContinueOperation::ExceptionFixup
+                    ContinueOperation::Terminate
                 };
             } else if result.is_ok() {
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::Resume;
             }
             // User-mode page fault that couldn't be resolved;
             // fall through to kill the TA below.
         }
         // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
         ctx.rax = (TeeResult::TargetDead as u32) as usize;
-        ContinueOperation::ExitThread
+        ContinueOperation::Terminate
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -208,14 +208,8 @@ impl GlobalState {
     }
 }
 
-type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
-    litebox::platform::common_providers::userspace_pointers::NoValidation,
-    T,
->;
-pub type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
-    litebox::platform::common_providers::userspace_pointers::NoValidation,
-    T,
->;
+type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+pub type UserConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -286,6 +280,22 @@ impl OpteeShim {
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
     }
+
+    /// Release all user-space memory mappings owned by this shim instance.
+    ///
+    /// This must be called before switching to the base page table and deleting
+    /// the task page table so that every mapped physical page is properly freed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references to the released memory regions
+    /// are held after this call.
+    pub unsafe fn release_user_mappings(&self) {
+        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| true;
+        unsafe {
+            let _ = self.page_manager().release_memory(release);
+        }
+    }
 }
 
 impl OpteeShimEntrypoints {
@@ -338,7 +348,7 @@ impl Task {
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         match self.thread.init_state.get() {
-            ThreadInitState::None => ContinueOperation::ExitThread,
+            ThreadInitState::None => ContinueOperation::Terminate,
             ThreadInitState::Ldelf { .. } => self.handle_ldelf_syscall_request(ctx),
             ThreadInitState::Ta { .. } => self.handle_ta_syscall_request(ctx),
         }
@@ -353,16 +363,16 @@ impl Task {
             Err(err) => {
                 // TODO: this seems like the wrong kind of error for OPTEE.
                 ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::Resume;
             }
         };
 
         if let SyscallRequest::Return { ret } = request {
             ctx.rax = self.sys_return(ret);
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         } else if let SyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
             SyscallRequest::Log { buf, len } => match buf.to_owned_slice(len) {
@@ -531,17 +541,17 @@ impl Task {
             Ok(()) => u32::from(TeeResult::Success),
             Err(e) => e.into(),
         } as usize;
-        ContinueOperation::ResumeGuest
+        ContinueOperation::Resume
     }
 
     fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         // Ensure handle_init_request is invoked at most once.
         if self.thread.initialized.replace(true) {
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         }
 
         match self.thread.init_state.get() {
-            ThreadInitState::None | ThreadInitState::Ta { .. } => ContinueOperation::ExitThread,
+            ThreadInitState::None | ThreadInitState::Ta { .. } => ContinueOperation::Terminate,
             ThreadInitState::Ldelf {
                 ldelf_arg_address,
                 entry_point,
@@ -556,7 +566,7 @@ impl Task {
                     ctx.ss = 0x2b; // __USER_DS
                     ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
-                ContinueOperation::ResumeGuest
+                ContinueOperation::Resume
             }
         }
     }
@@ -571,7 +581,7 @@ impl Task {
     fn handle_reenter_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let state = self.thread.init_state.get();
         match state {
-            ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::ExitThread,
+            ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::Terminate,
             ThreadInitState::Ta {
                 cmd_id,
                 params_address,
@@ -592,7 +602,7 @@ impl Task {
                     ctx.ss = 0x2b; // __USER_DS
                     ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
-                ContinueOperation::ResumeGuest
+                ContinueOperation::Resume
             }
         }
     }
@@ -606,7 +616,7 @@ impl Task {
             Err(err) => {
                 // TODO: this seems like the wrong kind of error for OPTEE.
                 ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::Resume;
             }
         };
 
@@ -615,10 +625,10 @@ impl Task {
             if ctx.rax == 0 {
                 self.get_ldelf_result();
             }
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         } else if let LdelfSyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
             LdelfSyscallRequest::Log { buf, len } => match buf.to_owned_slice(len) {
@@ -683,7 +693,7 @@ impl Task {
             Ok(()) => u32::from(TeeResult::Success),
             Err(e) => e.into(),
         } as usize;
-        ContinueOperation::ResumeGuest
+        ContinueOperation::Resume
     }
 
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.
@@ -1310,35 +1320,38 @@ pub(crate) enum ThreadInitState {
 
 /// Global session ID pool (Linux pidmap style).
 ///
-/// Uses spinlock-protected bitmap for recyclable IDs (1..=MAX_RECYCLABLE_SESSION_ID),
-/// with fallback to one-time IDs beyond that range.
+/// Uses [`IdPool`](litebox::utils::id_pool::IdPool) for recyclable IDs
+/// (1..=MAX_RECYCLABLE_SESSION_ID), with fallback to one-time IDs beyond
+/// that range.
 ///
-/// With MAX_RECYCLABLE_SESSION_ID = 65535:
-/// - Bitmap memory usage: (65535 + 1) bits = 8 KB
-/// - Recyclable IDs: 1..=65535 (65535 IDs)
-/// - Fallback (non-recyclable) IDs: 65536..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
+/// With MAX_RECYCLABLE_SESSION_ID = 65536:
+/// - Bitmap memory usage: 65536 bits = 8 KB
+/// - Recyclable IDs: 1..=65536 (65536 IDs)
+/// - Fallback (non-recyclable) IDs: 65537..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
 /// - PTA_SESSION_ID (0xffff_fffe) is reserved and never allocated
 ///
 /// Design notes:
 /// - A single TA instance can serve many concurrent sessions (no per-instance cap),
 ///   so the bitmap must cover realistic peak concurrency.
-/// - Allocation uses `last_id` as a hint for O(1) amortized scans; worst-case O(n)
+/// - Allocation uses wrap-around scanning for O(n/64) amortized cost; worst-case
 ///   full scan only occurs when the bitmap is nearly full.
-/// - 8 KB is modest for the secure world (with a small amount of memory) and avoids falling
-///   into the non-recyclable fallback path under normal workloads. Fallback IDs are
+/// - ~8 KB is modest for the secure world and avoids falling into the
+///   non-recyclable fallback path under normal workloads. Fallback IDs are
 ///   a one-way leak (never recycled).
 pub(crate) struct SessionIdPool {
-    bitmap: bitvec::vec::BitVec, // bit[id] set = in use; bit 0 unused (session ID 0 is invalid)
-    last_id: u32,                // for wrap-around scanning
-    fallback_next: u32,          // one-time IDs when bitmap exhausted
+    /// Recyclable ID pool. Pool ID `p` maps to session ID `p + 1`.
+    pool: litebox::utils::id_pool::IdPool,
+    /// Next one-time ID when the recyclable pool is exhausted.
+    fallback_next: u32,
 }
 
 fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
     static POOL: spin::once::Once<spin::mutex::SpinMutex<SessionIdPool>> = spin::once::Once::new();
     POOL.call_once(|| {
         spin::mutex::SpinMutex::new(SessionIdPool {
-            bitmap: bitvec::bitvec![0; SessionIdPool::MAX_RECYCLABLE_SESSION_ID as usize + 1],
-            last_id: 0,
+            pool: litebox::utils::id_pool::IdPool::with_capacity(
+                SessionIdPool::MAX_RECYCLABLE_SESSION_ID,
+            ),
             fallback_next: SessionIdPool::MAX_RECYCLABLE_SESSION_ID + 1,
         })
     })
@@ -1346,7 +1359,7 @@ fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
 
 impl SessionIdPool {
     /// Maximum recyclable session ID tracked by the bitmap.
-    const MAX_RECYCLABLE_SESSION_ID: u32 = 65535;
+    const MAX_RECYCLABLE_SESSION_ID: u32 = 65536;
     /// Reserved session ID for PTA.
     const PTA_SESSION_ID: u32 = 0xffff_fffe;
 
@@ -1357,18 +1370,9 @@ impl SessionIdPool {
     pub fn allocate() -> Option<u32> {
         let mut pool = session_id_pool().lock();
 
-        let start = if pool.last_id >= Self::MAX_RECYCLABLE_SESSION_ID {
-            1
-        } else {
-            pool.last_id + 1
-        };
-
-        for id in (start..=Self::MAX_RECYCLABLE_SESSION_ID).chain(1..start) {
-            if !pool.bitmap[id as usize] {
-                pool.bitmap.set(id as usize, true);
-                pool.last_id = id;
-                return Some(id);
-            }
+        // Try recyclable pool first (pool ID 0 → session ID 1, etc.)
+        if let Some(id) = pool.pool.allocate() {
+            return Some(id + 1);
         }
 
         // Bitmap exhausted - use fallback one-time IDs if available
@@ -1386,8 +1390,7 @@ impl SessionIdPool {
             return;
         }
 
-        let mut pool = session_id_pool().lock();
-        pool.bitmap.set(session_id as usize, false);
+        session_id_pool().lock().pool.recycle(session_id - 1);
     }
 
     pub fn get_pta_session_id() -> u32 {

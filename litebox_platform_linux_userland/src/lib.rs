@@ -9,12 +9,16 @@
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
+use std::unimplemented;
 
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
-use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+use litebox::platform::page_mgmt::{
+    CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
+};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
@@ -28,6 +32,84 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+// ---------------------------------------------------------------------------
+// TLS (`.tbss`) access helpers
+//
+// On x86_64, the ELF TLS model uses `@tpoff`; on x86 it uses `@ntpoff`.
+// At guest-host transitions we swap `fs` and `gs`, so after the swap the host TLS base
+// is in the normal segment register. Before the swap (e.g. in a signal
+// handler that fires while the guest is running), the host TLS base is
+// in the *saved* segment register (`gs` on x86_64, `fs` on x86).
+//
+// The macros below produce string literals so they can be used inside
+// `concat!()` within `core::arch::asm!()`.
+// ---------------------------------------------------------------------------
+
+/// TLS relocation suffix: `"@tpoff"` on x86_64, `"@ntpoff"` on x86.
+#[cfg(target_arch = "x86_64")]
+macro_rules! tls_suffix {
+    () => {
+        "@tpoff"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! tls_suffix {
+    () => {
+        "@ntpoff"
+    };
+}
+
+/// Segment register used for TLS after the fs/gs swap (normal host context).
+#[cfg(target_arch = "x86_64")]
+macro_rules! tls_seg {
+    () => {
+        "fs"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! tls_seg {
+    () => {
+        "gs"
+    };
+}
+
+/// Segment register where the host TLS base is saved before the swap
+/// (signal handler context while the guest is running).
+#[cfg(target_arch = "x86_64")]
+macro_rules! saved_tls_seg {
+    () => {
+        "gs"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! saved_tls_seg {
+    () => {
+        "fs"
+    };
+}
+
+/// Full TLS memory operand for a `.tbss` variable in normal host context
+/// (after the fs/gs swap).
+///
+/// Example: `tls!("pending_host_signals")` expands to
+/// `"fs:pending_host_signals@tpoff"` on x86_64.
+macro_rules! tls {
+    ($var:literal) => {
+        concat!(tls_seg!(), ":", $var, tls_suffix!())
+    };
+}
+
+/// Full TLS memory operand for a `.tbss` variable accessed via the *saved*
+/// segment register (before the fs/gs swap, e.g. from a signal handler).
+///
+/// Example: `saved_tls!("in_guest")` expands to
+/// `"gs:in_guest@tpoff"` on x86_64.
+macro_rules! saved_tls {
+    ($var:literal) => {
+        concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
+    };
+}
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -40,12 +122,24 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
+    /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
+    /// re-mmap the file.
+    cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LinuxUserland").finish_non_exhaustive()
     }
+}
+
+/// Information about a CoW-eligible memory region backed by a file.
+#[derive(Debug, Clone)]
+struct CowRegionInfo {
+    /// The path to the backing file on the host filesystem.
+    file_path: PathBuf,
+    /// Length of the backing file.
+    file_length: usize,
 }
 
 const IF_NAMESIZE: usize = 16;
@@ -163,8 +257,51 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
+            cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Register a CoW-eligible memory region backed by a file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an overlapping region is already registered.
+    pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<PathBuf>) {
+        let start = data.as_ptr() as usize;
+        let info = CowRegionInfo {
+            file_path: file_path.into(),
+            file_length: data.len(),
+        };
+
+        let mut regions = self.cow_regions.write().unwrap();
+        assert!(
+            regions.range(start..start + data.len()).next().is_none(),
+            "Attempting to register an overlapping region"
+        );
+        let old = regions.insert(start, info);
+        assert!(old.is_none());
+    }
+
+    /// Look up the file backing a static slice for CoW mapping.
+    ///
+    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
+    /// CoW region, `None` otherwise.
+    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(PathBuf, usize)> {
+        let slice_start = source_data.as_ptr() as usize;
+        let slice_len = source_data.len();
+
+        let regions = self.cow_regions.read().unwrap();
+
+        if let Some((&region_start, info)) = regions.range(..=slice_start).next_back() {
+            let region_end = region_start.checked_add(info.file_length).unwrap();
+            let slice_end = slice_start.checked_add(slice_len).unwrap();
+
+            if slice_start >= region_start && slice_end <= region_end {
+                return Some((info.file_path.clone(), slice_start - region_start));
+            }
+        }
+        None
     }
 
     /// Enable seccomp syscall interception on the platform.
@@ -308,6 +445,33 @@ impl LinuxUserland {
 
 impl litebox::platform::Provider for LinuxUserland {}
 
+impl litebox::platform::SignalProvider for LinuxUserland {
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
+        let sigs = take_pending_host_signals();
+        for sig in sigs {
+            f(sig);
+        }
+    }
+}
+
+/// Atomically takes the per-thread pending host signal bitmask.
+fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
+    // Atomically swap the per-thread pending signals with zero.
+    // Only the low 32 bits are used (covers traditional signals 1-31).
+    let lo: u32;
+    unsafe {
+        core::arch::asm!(
+            "xor {tmp:e}, {tmp:e}",
+            concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
+            tmp = out(reg) lo,
+            options(nostack)
+        );
+    }
+    litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.
@@ -389,6 +553,14 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+    .align 4
+.globl pending_host_signals
+pending_host_signals:
+    .long 0
+    .align 8
+.globl wait_waker_addr
+wait_waker_addr:
+    .quad 0
     "
 );
 
@@ -798,6 +970,14 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+    .align 4
+.globl pending_host_signals
+pending_host_signals:
+    .long 0
+    .align 4
+.global wait_waker_addr
+wait_waker_addr:
+    .long 0
     "
 );
 
@@ -835,6 +1015,46 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
         "jmp fs:scratch@ntpoff", // jump to the guest
         "switch_to_guest_end:",
     );
+}
+
+/// Non-guest threads (e.g., network workers, background tasks) should call this
+/// function at the start of their execution so the kernel only delivers
+/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
+/// context to re-enter the shim.
+fn block_guest_signals() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGALRM);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+    }
+}
+
+/// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
+/// signals before running `f`.
+///
+/// Every background thread created by a runner (network workers, I/O helpers,
+/// etc.) should use this function instead of [`std::thread::spawn`] to ensure
+/// that `SIGALRM` and `SIGINT` are only delivered to guest threads.
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = litebox_platform_linux_userland::spawn_host_thread(move || {
+///     // This thread will never receive SIGALRM or SIGINT.
+///     do_background_work();
+/// });
+/// ```
+pub fn spawn_host_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        block_guest_signals();
+        f()
+    })
 }
 
 fn thread_start(
@@ -926,10 +1146,57 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
         thread.interrupt();
     }
+
+    #[cfg(debug_assertions)]
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+        // to mirror the TLS base used in guest context, so that test threads can use the
+        // same TLS access code as guest threads.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!(
+                "rdfsbase {tmp}",
+                "wrgsbase {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            unsafe {
+                core::arch::asm!(
+                    "mov {tmp:x}, gs",
+                    "mov fs, {tmp:x}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+
+        ThreadHandle::run_with_handle(f)
+    }
 }
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
+
+    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
+    where
+        Self: litebox::sync::RawSyncPrimitivesProvider,
+    {
+        let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+        unsafe {
+            core::arch::asm!(
+                concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
+                inout(reg) waker_ptr,
+                options(nostack),
+            );
+        }
+        if !waker_ptr.is_null() {
+            // SAFETY: old waker_ptr was created by Box::into_raw in a previous call to update_waker.
+            unsafe { drop(Box::from_raw(waker_ptr)) };
+        }
+    }
 }
 
 pub struct RawMutex {
@@ -949,30 +1216,21 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(Ordering::SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-
         // We wait on the futex, with a timeout if needed
-        loop {
-            break match futex_timeout(
-                &self.inner,
-                FutexOperation::Wait,
-                /* expected value */ val,
-                timeout,
-                /* ignored */ None,
-            ) {
-                Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
-                Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
-                Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
-                Err(syscalls::Errno::EINTR) => continue,
-                Err(e) => {
-                    panic!("Unexpected errno={e} for FUTEX_WAIT")
-                }
-                _ => unreachable!(),
-            };
+        match futex_timeout(
+            &self.inner,
+            FutexOperation::Wait,
+            /* expected value */ val,
+            timeout,
+            /* ignored */ None,
+        ) {
+            Ok(0) | Err(syscalls::Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
+            Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => {
+                panic!("Unexpected errno={e} for FUTEX_WAIT")
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -1256,7 +1514,7 @@ fn futex_timeout(
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
 ) -> Result<usize, syscalls::Errno> {
-    let uaddr: *const AtomicU32 = uaddr as _;
+    let uaddr: *const AtomicU32 = std::ptr::from_ref(uaddr);
     let futex_op: i32 = futex_op as _;
     let timeout = timeout.map(|t| {
         const TEN_POWER_NINE: u128 = 1_000_000_000;
@@ -1310,7 +1568,7 @@ fn futex_val2(
     val2: u32,
     uaddr2: Option<&AtomicU32>,
 ) -> Result<usize, syscalls::Errno> {
-    let uaddr: *const AtomicU32 = uaddr as _;
+    let uaddr: *const AtomicU32 = std::ptr::from_ref(uaddr);
     let futex_op: i32 = futex_op as _;
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
@@ -1490,6 +1748,89 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
     }
+
+    fn try_allocate_cow_pages(
+        &self,
+        suggested_start: usize,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
+            return Err(CowAllocationError::UnsupportedSourceRegion);
+        };
+        if !file_offset.is_multiple_of(ALIGN) {
+            return Err(CowAllocationError::Unaligned);
+        }
+
+        let file_path_cstr =
+            std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
+        // TODO(jb): We should likely be storing pre-opened FDs, right?
+        let fd = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::open,
+                file_path_cstr.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
+        let fd = fd.expect("file should remain unchanged on host");
+
+        let mut flags = MapFlags::MAP_PRIVATE;
+        match fixed_address_behavior {
+            FixedAddressBehavior::Hint => {}
+            FixedAddressBehavior::Replace => flags |= MapFlags::MAP_FIXED,
+            FixedAddressBehavior::NoReplace => flags |= MapFlags::MAP_FIXED_NOREPLACE,
+        }
+
+        let result = unsafe {
+            syscalls::syscall6(
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        syscalls::Sysno::mmap
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        syscalls::Sysno::mmap2
+                    }
+                },
+                suggested_start,
+                source_data.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+                (flags.bits().reinterpret_as_unsigned()
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
+                fd,
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        file_offset
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        // mmap2 takes offset in pages, not bytes
+                        file_offset / ALIGN
+                    }
+                },
+            )
+        };
+
+        let _ = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::close,
+                fd, // This is to ensure it won't be intercepted by Seccomp if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
+
+        match result {
+            Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
+            Err(_) => Err(CowAllocationError::InternalFailure),
+        }
+    }
 }
 
 impl litebox::platform::StdioProvider for LinuxUserland {
@@ -1618,27 +1959,15 @@ impl ThreadContext<'_> {
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
         unsafe {
-            #[cfg(target_arch = "x86_64")]
             core::arch::asm!(
-                "mov BYTE PTR fs:interrupt@tpoff, 0",
-                options(nostack, preserves_flags)
-            );
-            #[cfg(target_arch = "x86")]
-            core::arch::asm!(
-                "mov BYTE PTR gs:interrupt@ntpoff, 0",
+                concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
                 options(nostack, preserves_flags)
             );
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
-            ContinueOperation::ExitThread => {}
-            ContinueOperation::ResumeKernelPlatform => {
-                panic!("ResumeKernelPlatform not expected in linux_userland")
-            }
-            ContinueOperation::ExceptionFixup => {
-                panic!("ExceptionFixup not expected in linux_userland")
-            }
+            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Terminate => {}
         }
     }
 }
@@ -1761,6 +2090,25 @@ fn register_exception_handlers() {
                 );
             }
         }
+
+        // Note that non-guest threads should block these signals, so it always fires on a guest thread.
+        let traditional_signals = &[libc::SIGINT, libc::SIGALRM];
+        for &sig in traditional_signals {
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
+                // Block the interrupt signal while handling signals
+                libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
+                let mut old_sa = core::mem::zeroed();
+                sigaction(sig, Some(&sa), &mut old_sa);
+                assert_eq!(
+                    old_sa.sa_sigaction,
+                    libc::SIG_DFL,
+                    "signal {sig} handler already installed",
+                );
+            }
+        }
     });
 }
 
@@ -1876,7 +2224,7 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.offset(-1))
+        Some(guest_context_top.sub(1))
     }
 }
 
@@ -2162,12 +2510,97 @@ unsafe fn next_signal_handler(
     }
 }
 
+/// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
+/// the thread is blocked on.
+///
+/// # Safety
+///
+/// Must be called from a signal handler on a guest thread whose saved host TLS
+/// segment register is valid.
+unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
+    let mask: u32 = 1u32 << (signal.as_i32() - 1);
+    unsafe {
+        core::arch::asm!(
+            concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
+            mask = in(reg) mask,
+            options(nostack)
+        );
+    }
+    let waker_addr: usize;
+    unsafe {
+        core::arch::asm!(
+            concat!("mov {}, ", saved_tls!("wait_waker_addr")),
+            out(reg) waker_addr,
+            options(nostack, preserves_flags)
+        );
+    }
+    if waker_addr == 0 {
+        return;
+    }
+    // SAFETY: if `waker_addr` is not zero, that means the current thread is suspended
+    // to handle this signal and it points to a valid Waker whose lifetime spans the
+    // entire interruptible wait, set by [`RawMutexProvider::update_waker`].
+    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
+    waker.wake();
+}
+
 /// Signal handler for interrupt signals.
 unsafe fn interrupt_signal_handler(
-    _signum: libc::c_int,
+    signum: libc::c_int,
     _info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let raise_signal = |signum: libc::c_int| {
+        // block the signal on this non-guest thread so the kernel won't
+        // deliver it here again, then re-raise as process-directed so a
+        // guest thread picks it up.
+        //
+        // This should only be called by test threads (spawned via cargo test).
+        // Other non-guest threads like network worker threads should have already blocked these signals.
+        unsafe {
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, signum);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+            libc::kill(libc::getpid(), signum);
+        }
+    };
+
+    // Record host-originated signals (SIGINT, SIGALRM, etc.) in the
+    // per-thread pending bitmask so the shim can forward them to the guest.
+    // TODO: no realtime signal support for now.
+    if signum > 0 && signum < 32 {
+        // Only record signals that can be forwarded to the guest as
+        // litebox_common_linux::signal::Signal. Unknown signals are silently dropped.
+        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(signum) else {
+            return;
+        };
+
+        // Check whether the saved host TLS segment is valid (i.e. this is a
+        // guest thread). If not, re-raise the signal process-wide.
+        let is_guest_thread;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let gsbase: u64;
+            unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+            is_guest_thread = gsbase != 0;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let fs: u16;
+            unsafe { core::arch::asm!("mov {:x}, fs", out(reg) fs, options(nostack, nomem)) };
+            is_guest_thread = fs != 0;
+        }
+
+        if is_guest_thread {
+            // SAFETY: we verified the saved host TLS segment is valid above.
+            unsafe { record_pending_signal(signal) };
+        } else {
+            raise_signal(signum);
+            return;
+        }
+    }
+
     // The interrupt signal can arrive in different contexts:
     // 1. The thread is running in the host at the beginning of the syscall
     //    handler. Do nothing--the syscall handler will handle the interrupt.

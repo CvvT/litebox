@@ -45,6 +45,7 @@ pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
+pub mod transport;
 mod wait;
 
 pub type DefaultFS = LinuxFS;
@@ -107,9 +108,9 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
             }
             .is_ok()
             {
-                return ContinueOperation::ResumeKernelPlatform;
+                return ContinueOperation::Resume;
             } else {
-                return ContinueOperation::ExceptionFixup;
+                return ContinueOperation::Terminate;
             }
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
@@ -132,9 +133,9 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         }
         f(&self.task, ctx);
         if self.task.prepare_to_run_guest(ctx) {
-            ContinueOperation::ResumeGuest
+            ContinueOperation::Resume
         } else {
-            ContinueOperation::ExitThread
+            ContinueOperation::Terminate
         }
     }
 }
@@ -294,6 +295,17 @@ impl<FS: ShimFS> LinuxShim<FS> {
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
         self.0.net.lock().perform_platform_interaction()
+    }
+
+    /// Establish a TCP connection to the given address.
+    ///
+    /// Returns a [`transport::ShimTransport`] that can be used as a
+    /// byte-stream transport (e.g., for a 9P filesystem client).
+    pub fn tcp_connection(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<transport::ShimTransport, Errno> {
+        transport::ShimTransport::connect(self.0.clone(), addr)
     }
 }
 
@@ -713,6 +725,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Chdir { pathname } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,

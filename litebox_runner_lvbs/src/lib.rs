@@ -20,9 +20,9 @@ use litebox_common_optee::{
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::{
-    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
+    arch::{gdt, instrs::hlt_loop, interrupts},
     debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
+    host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
@@ -30,8 +30,11 @@ use litebox_platform_lvbs::{
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
-            VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
-            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
+            VSM_SK_PTE_PAGES_COUNT, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
+            VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE, VTL1_PTE_0_PAGE, VTL1_REMAP_PDE_PAGE,
+            VTL1_REMAP_PDPT_PAGE, get_heap_start_address, get_memory_base_address,
+            get_rela_end_address, get_rela_start_address, get_text_end_address,
+            get_text_start_address,
         },
     },
     serial_println,
@@ -47,73 +50,162 @@ use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 
+/// Seed the initial heap regions so the global allocator has enough memory
+/// for slab-backed allocations (the slab needs >= 2 MB backing pages).
+pub fn seed_initial_heap() {
+    let vtl1_base_va = get_memory_base_address();
+    let vtl1_start = Platform::va_to_pa(x86_64::VirtAddr::new(vtl1_base_va));
+
+    let mem_fill_start =
+        TruncateExt::<usize>::truncate(vtl1_base_va) + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
+    unsafe {
+        Platform::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
+    }
+    debug_serial_println!(
+        "heap: seed init region (pages {}..+{:#x}): VA {:#x}, size {:#x}",
+        VTL1_INIT_HEAP_START_PAGE,
+        VTL1_INIT_HEAP_SIZE,
+        mem_fill_start,
+        VTL1_INIT_HEAP_SIZE
+    );
+
+    // Add pre-populated region (_heap_start .. end of Phase 1 mapping).
+    let heap_va = get_heap_start_address();
+    let mem_fill_start: usize = heap_va.truncate();
+    let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
+    let heap_offset: usize = TruncateExt::<usize>::truncate(heap_phys - vtl1_start.as_u64());
+    let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
+    unsafe {
+        Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+    }
+    debug_serial_println!(
+        "heap: add pre-populated region (_heap_start..Phase 1 end): VA {:#x}, size {:#x}",
+        mem_fill_start,
+        mem_fill_size
+    );
+}
+
+/// Initialize the current core.
+///
+/// When `is_bsp` is `true`, creates the platform, sets up page tables, and
+/// reclaims early memory.
+/// All cores then initialize hypercalls, GDT, IDT, interrupts, and syscall
+/// support.
+///
 /// # Panics
 ///
-/// Panics if it failed to enable Hyper-V hypercall
-pub fn init() -> Option<&'static Platform> {
-    let mut ret: Option<&'static Platform> = None;
+/// Panics if VTL1 memory info is unavailable (BSP) or if hypercall
+/// initialization fails.
+pub fn init(is_bsp: bool) -> Option<&'static Platform> {
+    let ret = if is_bsp {
+        let (start, size) = get_vtl1_memory_info().expect("Failed to get memory info");
+        let vtl1_start = x86_64::PhysAddr::new(start);
+        let vtl1_end = x86_64::PhysAddr::new(start + size);
 
-    if get_core_id() == 0 {
-        if let Ok((start, size)) = get_vtl1_memory_info() {
-            let vtl1_start = x86_64::PhysAddr::new(start);
-            let vtl1_end = x86_64::PhysAddr::new(start + size);
+        // Re-compute the pre-populated region bounds needed for the
+        // remaining-memory add after `Platform::new()` below.
+        let heap_va = get_heap_start_address();
+        let mem_fill_start: usize = heap_va.truncate();
+        let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
+        let heap_offset: usize = TruncateExt::<usize>::truncate(heap_phys - start);
+        let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
 
-            // Add a small range of mapped memory to the global allocator for populating the base page table.
-            // `VTL1_INIT_HEAP_START_PAGE` and `VTL1_INIT_HEP_SIZE` specify a physical address range which is
-            // not used by the VTL1 kernel.
-            let mem_fill_start =
-                TruncateExt::<usize>::truncate(Platform::pa_to_va(vtl1_start).as_u64())
-                    + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
-            let mem_fill_size = VTL1_INIT_HEAP_SIZE;
+        // Text section boundaries. These are used by the platform to mark
+        // code pages executable and everything else NO_EXECUTE (DEP).
+        // After two-phase relocation, linker symbols return
+        // high-canonical VAs; convert to PA for the page table mapper.
+        let text_phys_start = Platform::va_to_pa(x86_64::VirtAddr::new(get_text_start_address()));
+        let text_phys_end = Platform::va_to_pa(x86_64::VirtAddr::new(get_text_end_address()));
+
+        // Reclaim .rela.dyn section memory now that relocations have been applied
+        // and we are running at high-canonical addresses.
+        // After two-phase relocation, `get_rela_start/end_address()` return
+        // high-canonical VAs. Use directly for the allocator.
+        let rela_va = get_rela_start_address();
+        let rela_size: usize = (get_rela_end_address() - rela_va).truncate();
+        if rela_size > 0 {
+            let rela_virt: usize = rela_va.truncate();
             unsafe {
-                Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+                Platform::mem_fill_pages(rela_virt, rela_size);
             }
             debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
-                mem_fill_start,
-                mem_fill_size
+                "heap: reclaim .rela.dyn section: VA {:#x}, size {:#x}",
+                rela_virt,
+                rela_size
             );
-
-            // Add remaining mapped but non-used memory pages (between `get_heap_start_address()` and
-            // `vtl1_start + VTL1_PRE_POPULATED_MEMORY_SIZE`) to the global allocator.
-            let mem_fill_start: usize = get_heap_start_address().truncate();
-            let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE
-                - TruncateExt::<usize>::truncate(get_heap_start_address() - start);
-            unsafe {
-                Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
-            }
-            debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
-                mem_fill_start,
-                mem_fill_size
-            );
-
-            let pml4_table_addr = vtl1_start + (PAGE_SIZE * VTL1_PML4E_PAGE) as u64;
-            let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
-            ret = Some(platform);
-            litebox_platform_multiplex::set_platform(platform);
-
-            // Add the rest of the VTL1 memory to the global allocator once they are mapped to the base page table.
-            let mem_fill_start = mem_fill_start + mem_fill_size;
-            let mem_fill_size = TruncateExt::<usize>::truncate(
-                size - (mem_fill_start as u64 - Platform::pa_to_va(vtl1_start).as_u64()),
-            );
-            unsafe {
-                Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
-            }
-            debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
-                mem_fill_start,
-                mem_fill_size
-            );
-
-            allocate_per_cpu_variables();
-        } else {
-            panic!("Failed to get memory info");
         }
-    }
 
-    if let Err(e) = hvcall::init() {
+        let platform = Platform::new(vtl1_start, vtl1_end, text_phys_start, text_phys_end);
+        litebox_platform_multiplex::set_platform(platform);
+
+        // Reclaim Phase 1 / VTL0 page table frames now that Platform::new()
+        // has loaded a fresh base page table covering all VTL1 memory.
+        // These physical pages are no longer referenced by CR3.
+        {
+            // Reclaim pages 2–12 (PML4, PDPT, PDE, 8 PTE pages)
+            let early_pt_pa = vtl1_start + (VTL1_PML4E_PAGE * PAGE_SIZE) as u64;
+            let early_pt_start: usize =
+                TruncateExt::<usize>::truncate(Platform::pa_to_va(early_pt_pa).as_u64());
+            let early_pt_size: usize =
+                (VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT - VTL1_PML4E_PAGE) * PAGE_SIZE;
+            // Safety: the early page table frames are no longer referenced
+            // (CR3 now points to the Phase 2 base page table).
+            unsafe {
+                Platform::mem_fill_pages(early_pt_start, early_pt_size);
+            }
+            debug_serial_println!(
+                "heap: reclaim early page table frames (pages {}..{}): VA {:#x}, size {:#x}",
+                VTL1_PML4E_PAGE,
+                VTL1_PML4E_PAGE + (early_pt_size / PAGE_SIZE),
+                early_pt_start,
+                early_pt_size
+            );
+
+            // NOTE: The boot stack page (VTL1_KERNEL_STACK_PAGE) MUST NOT be
+            // reclaimed here. APs reuse it as their initial RSP when they
+            // enter VTL1 via `hvcall_enable_vp_vtl`.
+
+            // Reclaim Phase 1 PDPT and PDE pages
+            let remap_pt_pa = vtl1_start + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
+            let remap_pt_start: usize =
+                TruncateExt::<usize>::truncate(Platform::pa_to_va(remap_pt_pa).as_u64());
+            let remap_pt_size: usize = (VTL1_REMAP_PDE_PAGE - VTL1_REMAP_PDPT_PAGE + 1) * PAGE_SIZE;
+            unsafe {
+                Platform::mem_fill_pages(remap_pt_start, remap_pt_size);
+            }
+            debug_serial_println!(
+                "heap: reclaim Phase 1 remap PT frames (pages {}..{}): VA {:#x}, size {:#x}",
+                VTL1_REMAP_PDPT_PAGE,
+                VTL1_REMAP_PDE_PAGE + 1,
+                remap_pt_start,
+                remap_pt_size
+            );
+        }
+
+        // Add the rest of the VTL1 memory to the global allocator once they are mapped to the base page table.
+        let mem_fill_start = mem_fill_start + mem_fill_size;
+        let mem_fill_size = TruncateExt::<usize>::truncate(
+            size - (mem_fill_start as u64 - Platform::pa_to_va(vtl1_start).as_u64()),
+        );
+        unsafe {
+            Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+        }
+        debug_serial_println!(
+            "heap: add remaining VTL1 memory (post Phase 2): VA {:#x}, size {:#x}",
+            mem_fill_start,
+            mem_fill_size
+        );
+
+        Some(platform)
+    } else {
+        None
+    };
+
+    // Allocate XSAVE areas now that we are on the kernel stack (the CPUID
+    // queries and aligned-vec allocations need a lot of stack space).
+    per_cpu_variables::allocate_xsave_area();
+
+    if let Err(e) = hvcall::init(is_bsp) {
         panic!("Err: {:?}", e);
     }
     gdt::init();
@@ -249,6 +341,28 @@ unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturn
         platform
             .delete_task_page_table(task_pt_id)
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+}
+
+/// Tears down a TA's memory mappings and page table.
+///
+/// This performs the following steps in order:
+/// 1. Release user-space memory mappings in the TA's page table
+/// 2. Switch to the base page table
+/// 3. Delete the TA's page table
+///
+/// # Safety
+///
+/// The caller must ensure that no references to user-space memory mapped by
+/// this task's page table are held after this call.
+unsafe fn teardown_ta_page_table(shim: &litebox_shim_optee::OpteeShim, task_pt_id: usize) {
+    unsafe {
+        // this function unmaps/deallocates user pages in the **active** page table, so we must
+        // still be on the TA's page table.
+        shim.release_user_mappings();
+        switch_to_base_page_table();
+        // Now delete the TA's page table without memory leak.
+        let _ = delete_task_page_table(task_pt_id);
     }
 }
 
@@ -512,10 +626,9 @@ fn open_session_single_instance(
 
                 session_manager().remove_single_instance(&ta_uuid);
 
-                // Switch to base page table and delete the task page table
-                unsafe { switch_to_base_page_table() };
-                // Safety: We've switched to the base page table above.
-                let _ = unsafe { delete_task_page_table(task_pt_id) };
+                // Safety: We are about to tear down this TA instance;
+                // no references to user-space memory will be held afterwards.
+                unsafe { teardown_ta_page_table(&instance_arc.lock().shim, task_pt_id) };
 
                 // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
                 // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
@@ -610,9 +723,9 @@ fn open_session_new_instance(
             runner_session_id,
         )
         .map_err(|_| {
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::ENomem
         })?,
     );
@@ -643,9 +756,9 @@ fn open_session_new_instance(
             "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
             ldelf_return_code
         );
-        unsafe { switch_to_base_page_table() };
-        // Safety: We've switched to the base page table above.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         // Write error response back to normal world
         write_msg_args_to_normal_world(
@@ -662,9 +775,9 @@ fn open_session_new_instance(
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
-        unsafe { switch_to_base_page_table() };
-        // Safety: We've switched to the base page table above.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
     loaded_program
@@ -678,9 +791,9 @@ fn open_session_new_instance(
             None,
         )
         .map_err(|_| {
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadCmd
         })?;
 
@@ -723,10 +836,9 @@ fn open_session_new_instance(
             Some(ta_req_info),
         )?;
 
-        // Tear down the page table - no session was registered
-        unsafe { switch_to_base_page_table() };
-        // Safety: We've switched to the base page table above.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         return Ok(());
     }
@@ -879,10 +991,9 @@ fn handle_invoke_command(
                 session_manager().remove_single_instance(&ta_uuid);
             }
 
-            // Switch to base page table and delete the task page table
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&instance_arc.lock().shim, task_pt_id) };
             debug_serial_println!(
                 "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
                 task_pt_id
@@ -1009,16 +1120,13 @@ fn handle_close_session(
             let instance = entry.instance.lock();
             let task_pt_id = instance.task_page_table_id;
 
-            // Make sure we're on the base page table before deleting
-            unsafe { switch_to_base_page_table() };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
 
             // Drop the instance to release shim/loaded_program resources
             drop(instance);
             drop(entry);
-
-            // Delete the task page table
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
 
             debug_serial_println!(
                 "CloseSession complete: deleted task_pt_id={} (last session)",
