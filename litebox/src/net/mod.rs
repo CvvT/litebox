@@ -513,11 +513,8 @@ where
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
-        for (_, mut handle) in self
-            .litebox
-            .descriptor_table_mut()
-            .iter_mut::<Network<Platform>>()
-        {
+        let table = self.litebox.descriptor_table();
+        for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
                 // check if there is pending data to be sent
@@ -1006,7 +1003,9 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
 
-        if let Some(proxy) = &socket_handle.proxy {
+        if ret.is_ok()
+            && let Some(proxy) = &socket_handle.proxy
+        {
             proxy.set_state(socket_channel::SocketState::Connected);
         }
         drop(table_entry);
@@ -1142,13 +1141,13 @@ where
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                let _ = socket.bind(local_endpoint).map_err(|e| {
+                socket.bind(local_endpoint).map_err(|e| {
                     self.local_port_allocator.deallocate(lp);
                     match e {
                         udp::BindError::InvalidState => BindError::AlreadyBound,
                         udp::BindError::Unaddressable => unreachable!(),
                     }
-                });
+                })?;
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
