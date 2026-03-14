@@ -74,7 +74,7 @@ d. **Look for missing edge cases** – common Linux edge cases that are easy to 
    - `lseek` on a pipe must return `ESPIPE`
    - `getpid` / `gettid` must return consistent values across threads
    - `clock_gettime(CLOCK_REALTIME)` vs `CLOCK_MONOTONIC` semantics
-e. **Check uname sysname** – LiteBox returns `"LiteBox"` not `"Linux"`, which can break software that checks `uname().sysname`. Note this as an intentional deviation but flag programs that break.
+e. **Check uname sysname** – LiteBox returns `"LiteBox"` not `"Linux"`, which can break software that checks `uname().sysname`. This is an intentional deviation — do **not** file an issue for the `sysname` field itself. However, if you discover that the deviation causes a specific, demonstrable failure in a real-world program (e.g., a libc routine that refuses to run because `sysname != "Linux"`), file an issue describing that concrete breakage.
 
 ### 4. Generate C Tests
 
@@ -97,10 +97,11 @@ For each gap, suggest a concrete Rust code change to `litebox_shim_linux` that w
 
 ### 6. Update Cache-Memory
 
-Write `syscall-gap-scanner-state.json` with:
+Write `syscall-gap-scanner-state.json` with the ISO 8601 date of today's run:
 ```json
 { "last_module_index": <N>, "last_run": "<YYYY-MM-DD>" }
 ```
+Replace `<YYYY-MM-DD>` with today's actual date in ISO 8601 format (e.g., `2025-06-02`).
 
 ### 7. Output Decision
 
@@ -156,4 +157,4 @@ Scan date: YYYY-MM-DD
 
 - Intentional deviations that are documented in comments (e.g., `uname` returning `"LiteBox"`).
 - Syscalls that are intentionally unimplemented for security reasons (check for comments explaining this).
-- Gaps already tracked in open issues (search existing issues first before filing a duplicate).
+- Gaps already tracked in open issues (search existing issues using the query `is:issue is:open "Syscall Gap"` before filing a duplicate; if a matching open issue exists for the same syscall name, skip filing a new one).
