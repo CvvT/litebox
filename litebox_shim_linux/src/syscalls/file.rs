@@ -369,7 +369,10 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::Eventfd { file, .. } => {
                 let file = file.clone();
                 drop(file_table);
-                let value: u64 = u64::from_le_bytes(
+                if buf.len() < size_of::<u64>() {
+                    return Err(Errno::EINVAL);
+                }
+                let value = u64::from_le_bytes(
                     buf[..size_of::<u64>()]
                         .try_into()
                         .map_err(|_| Errno::EINVAL)?,
@@ -380,9 +383,6 @@ impl<FS: ShimFS> Task<FS> {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
             }
         };
-        if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
-        }
         res
     }
 
@@ -644,9 +644,6 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
         };
-        if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
-        }
         res
     }
 
