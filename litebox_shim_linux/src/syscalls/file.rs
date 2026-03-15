@@ -18,7 +18,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, TimeParam, errno::Errno, signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -383,6 +383,12 @@ impl<FS: ShimFS> Task<FS> {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
             }
         };
+        if let Err(Errno::EPIPE) = res {
+            self.send_signal(
+                Signal::SIGPIPE,
+                crate::syscalls::signal::siginfo_kill(Signal::SIGPIPE),
+            );
+        }
         res
     }
 
@@ -644,6 +650,12 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
         };
+        if let Err(Errno::EPIPE) = res {
+            self.send_signal(
+                Signal::SIGPIPE,
+                crate::syscalls::signal::siginfo_kill(Signal::SIGPIPE),
+            );
+        }
         res
     }
 
