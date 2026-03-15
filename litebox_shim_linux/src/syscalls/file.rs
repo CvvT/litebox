@@ -18,7 +18,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, TimeParam, errno::Errno, signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -369,7 +369,10 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::Eventfd { file, .. } => {
                 let file = file.clone();
                 drop(file_table);
-                let value: u64 = u64::from_le_bytes(
+                if buf.len() < size_of::<u64>() {
+                    return Err(Errno::EINVAL);
+                }
+                let value = u64::from_le_bytes(
                     buf[..size_of::<u64>()]
                         .try_into()
                         .map_err(|_| Errno::EINVAL)?,
@@ -381,7 +384,10 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            self.send_signal(
+                Signal::SIGPIPE,
+                crate::syscalls::signal::siginfo_kill(Signal::SIGPIPE),
+            );
         }
         res
     }
@@ -645,7 +651,10 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::Unix { .. } => todo!(),
         };
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            self.send_signal(
+                Signal::SIGPIPE,
+                crate::syscalls::signal::siginfo_kill(Signal::SIGPIPE),
+            );
         }
         res
     }
