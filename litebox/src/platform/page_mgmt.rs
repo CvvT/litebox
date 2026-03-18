@@ -140,7 +140,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
             new_ptr
                 .write_slice_at_offset(
                     isize::try_from(offset).unwrap(),
-                    &old_ptr.to_owned_slice(old_range.len()).unwrap(),
+                    &old_ptr.to_owned_slice(ALIGN).unwrap(),
                 )
                 .unwrap();
             offset += ALIGN;
