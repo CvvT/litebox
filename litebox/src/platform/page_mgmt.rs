@@ -135,15 +135,16 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         let total_len = old_range.len();
         let mut offset = 0;
         while offset < total_len {
+            let chunk_size = (total_len - offset).min(ALIGN);
             let old_ptr =
                 <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start + offset);
             new_ptr
                 .write_slice_at_offset(
                     isize::try_from(offset).unwrap(),
-                    &old_ptr.to_owned_slice(ALIGN).unwrap(),
+                    &old_ptr.to_owned_slice(chunk_size).unwrap(),
                 )
                 .unwrap();
-            offset += ALIGN;
+            offset += chunk_size;
         }
 
         if temp_permissions != permissions {
