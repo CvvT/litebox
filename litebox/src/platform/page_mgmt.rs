@@ -144,7 +144,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                     &old_ptr.to_owned_slice(chunk_size).unwrap(),
                 )
                 .unwrap();
-            offset += chunk_size;
+            offset += ALIGN;
         }
 
         if temp_permissions != permissions {
