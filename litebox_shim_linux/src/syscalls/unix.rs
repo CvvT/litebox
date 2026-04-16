@@ -20,6 +20,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::WaitContext,
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
@@ -34,6 +35,12 @@ use crate::{
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
+
+pub(crate) struct UnixSocketSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
+impl<FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<FS> {
+    type Entry = UnixSocket<FS>;
+}
+impl<FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<FS> {}
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -1372,7 +1379,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     unreachable!()
                 }
                 // Don't allow changing socket type and credentials
-                SocketOption::TYPE | SocketOption::PEERCRED => Err(Errno::ENOPROTOOPT),
+                SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
+                    Err(Errno::ENOPROTOOPT)
+                }
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
             },
@@ -1419,6 +1428,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 | SocketOption::BROADCAST => {
                     unreachable!()
                 }
+                // Unix sockets don't track async errors
+                SocketOption::ERROR => 0,
                 SocketOption::TYPE => match self.inner {
                     UnixSocketInner::Stream(_) => SockType::Stream as u32,
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,

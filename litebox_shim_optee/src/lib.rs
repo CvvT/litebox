@@ -38,8 +38,8 @@ pub mod ptr;
 
 // Re-export session management types for convenience
 pub use session::{
-    MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SingleInstanceCache, TaInstance,
-    allocate_session_id,
+    CreationReservation, MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap,
+    SingleInstanceCache, TaInstance, allocate_session_id,
 };
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -389,26 +389,30 @@ impl Task {
                 prop_type,
             } => {
                 if let Some(buf_length) = blen.read_at_offset(0)
-                    && usize::try_from(buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
+                    && (buf_length as usize) <= MAX_KERNEL_BUF_SIZE
                 {
-                    let mut prop_buf = vec![0u8; usize::try_from(buf_length).unwrap()];
+                    let mut prop_buf = vec![0u8; buf_length as usize];
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
-                        todo!("return the name of a given property index")
+                        #[cfg(debug_assertions)]
+                        todo!("return the name of a given property index");
+                        #[cfg(not(debug_assertions))]
+                        Err(TeeResult::NotSupported)
+                    } else {
+                        self.sys_get_property(
+                            prop_set,
+                            index,
+                            None,
+                            None,
+                            &mut prop_buf,
+                            blen,
+                            prop_type,
+                        )
+                        .and_then(|()| {
+                            buf.copy_from_slice(0, &prop_buf)
+                                .ok_or(TeeResult::ShortBuffer)?;
+                            Ok(())
+                        })
                     }
-                    self.sys_get_property(
-                        prop_set,
-                        index,
-                        None,
-                        None,
-                        &mut prop_buf,
-                        blen,
-                        prop_type,
-                    )
-                    .and_then(|()| {
-                        buf.copy_from_slice(0, &prop_buf)
-                            .ok_or(TeeResult::ShortBuffer)?;
-                        Ok(())
-                    })
                 } else {
                     Err(TeeResult::BadParameters)
                 }
@@ -534,7 +538,12 @@ impl Task {
                         })
                 }
             }
-            _ => todo!(),
+            _ => {
+                #[cfg(debug_assertions)]
+                todo!("unsupported syscall request");
+                #[cfg(not(debug_assertions))]
+                Err(TeeResult::NotSupported)
+            }
         };
 
         ctx.rax = match res {
@@ -686,7 +695,7 @@ impl Task {
                         })
                 }
             }
-            _ => todo!(),
+            _ => Err(TeeResult::NotSupported),
         };
 
         ctx.rax = match res {
@@ -742,10 +751,10 @@ impl Task {
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
-            cmd_id: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
+            cmd_id: cmd_id.unwrap_or(0) as usize,
             params_address: ta_stack.get_params_address(),
-            session_id: usize::try_from(session_id.unwrap_or(self.session_id)).unwrap(),
-            func_id: usize::try_from(func_id).unwrap(),
+            session_id: session_id.unwrap_or(self.session_id) as usize,
+            func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
         })
@@ -814,7 +823,7 @@ impl Task {
         if let Some(ldelf_arg_address) = ldelf_arg_address {
             let ldelf_arg_ptr = UserConstPtr::<LdelfArg>::from_usize(ldelf_arg_address);
             if let Some(ldef_arg) = ldelf_arg_ptr.read_at_offset(0) {
-                let entry_func = usize::try_from(ldef_arg.entry_func).unwrap();
+                let entry_func = ldef_arg.entry_func.truncate();
                 // If `ldelf` has been successfully executed, it loads the given TA and stores the TA's entry
                 // point into `ldelf_arg.entry_func`.
                 self.set_ta_entry_point(entry_func);
@@ -870,12 +879,12 @@ where
 {
     if let Some(src_slice) = src.to_owned_slice(src_len)
         && let Some(length) = dst_len.read_at_offset(0)
-        && usize::try_from(length).unwrap() <= MAX_KERNEL_BUF_SIZE
+        && length <= MAX_KERNEL_BUF_SIZE as u64
     {
-        let mut length = usize::try_from(length).unwrap();
+        let mut length: usize = length.truncate();
         let mut kernel_buf = vec![0u8; length];
         syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
-            let _ = dst_len.write_at_offset(0, u64::try_from(length).unwrap());
+            let _ = dst_len.write_at_offset(0, length as u64);
             dst.copy_from_slice(0, &kernel_buf[..length])
                 .ok_or(TeeResult::OutOfMemory)
         })
@@ -974,33 +983,35 @@ impl TeeObjMap {
     ) -> Result<(), TeeResult> {
         let mut inner = self.inner.lock();
         if let Some(tee_obj) = inner.get_mut(&handle) {
-            tee_obj.initialize();
-
             if user_attrs.is_empty() {
+                tee_obj.initialize();
                 return Ok(());
             }
 
             // TODO: support multiple attributes (e.g., two-key crypto algorithms like AES-XTS)
-            match user_attrs[0].attribute_id {
-                TeeAttributeType::SecretValue => {
-                    let key_addr: usize = user_attrs[0].a.truncate();
-                    let key_len: usize = user_attrs[0].b.truncate();
-                    // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
-                    if key_len > MAX_KERNEL_BUF_SIZE {
-                        return Err(TeeResult::BadParameters);
-                    }
-                    let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
-                    let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
-                        return Err(TeeResult::BadParameters);
-                    };
-                    tee_obj.set_key(&key_box);
+            if user_attrs[0].attribute_id == TeeAttributeType::SecretValue {
+                let key_addr: usize = user_attrs[0].a.truncate();
+                let key_len: usize = user_attrs[0].b.truncate();
+                // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
+                if key_len > MAX_KERNEL_BUF_SIZE {
+                    return Err(TeeResult::BadParameters);
                 }
-                _ => todo!(
+                let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
+                let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
+                    return Err(TeeResult::BadParameters);
+                };
+                tee_obj.set_key(&key_box);
+            } else {
+                #[cfg(debug_assertions)]
+                todo!(
                     "handle attribute ID: {}",
                     user_attrs[0].attribute_id.value()
-                ),
+                );
+                #[cfg(not(debug_assertions))]
+                return Err(TeeResult::NotSupported);
             }
 
+            tee_obj.initialize();
             Ok(())
         } else {
             Err(TeeResult::ItemNotFound)

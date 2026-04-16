@@ -107,6 +107,12 @@ fn main() -> Result<()> {
             _ => tracing::Level::TRACE,
         })
         .init();
+    if cli_args.lock_tracing && std::env::var_os("LITEBOX_LOG").is_none() {
+        warn!("--lock-tracing is enabled but LITEBOX_LOG is not set");
+        warn!("  lock trace output will not be visible");
+        warn!("  set e.g. LITEBOX_LOG=trace to see lock tracing output");
+        warn!("  also confirm the CONFIG_PRINT_* booleans in lock_tracing.rs are enabled");
+    }
     if cli_args.verbose > 2 {
         warn!(
             verbosity = cli_args.verbose,
@@ -508,7 +514,30 @@ fn find_dependencies(sh: &xshell::Shell, command: &str) -> Result<Vec<PathBuf>> 
             }
         }
     }
-    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = {
+        let mut paths: Vec<_> = paths.into_iter().map(PathBuf::from).collect();
+
+        // libgcc_s.so.1 is not always a direct link-time dependency (ldd won't list it), but
+        // glibc's pthread_cancel needs it at runtime for forced stack unwinding. Without it the
+        // we get SIGABRTs.
+        let libgcc_s: Option<PathBuf> = [
+            "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "/usr/lib64/libgcc_s.so.1",
+            "/lib64/libgcc_s.so.1",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists());
+        if let Some(libgcc_s) = libgcc_s
+            && !paths.contains(&libgcc_s)
+        {
+            paths.push(libgcc_s);
+        }
+
+        paths
+    };
+
     for p in &paths {
         if !p.exists() {
             warn!(path = %p.display(), "Resolved dependency path does not exist");

@@ -7,6 +7,7 @@ use litebox::mm::linux::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
 use litebox::path::Arg;
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
+use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeUuid, UserTaPropType,
     UteeParams,
@@ -73,7 +74,10 @@ impl Task {
         prop_type: UserMutPtr<u32>,
     ) -> Result<(), TeeResult> {
         if name_buf.is_some() && name_len.is_some() {
-            todo!("return the name of a given property index")
+            #[cfg(debug_assertions)]
+            todo!("return the name of a given property index");
+            #[cfg(not(debug_assertions))]
+            return Err(TeeResult::NotSupported);
         }
         match GpdPropertyIndex::try_from(index).unwrap_or(GpdPropertyIndex::None) {
             GpdPropertyIndex::ClientIdentity => {
@@ -86,10 +90,7 @@ impl Task {
                 let identity = self.client_identity;
                 prop_buf.copy_from_slice(identity.as_bytes());
                 prop_len
-                    .write_at_offset(
-                        0,
-                        u32::try_from(core::mem::size_of::<TeeIdentity>()).unwrap(),
-                    )
+                    .write_at_offset(0, core::mem::size_of::<TeeIdentity>().truncate())
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Identity as u32)
@@ -106,7 +107,7 @@ impl Task {
                 let ta_uuid = self.ta_app_id;
                 prop_buf.copy_from_slice(ta_uuid.as_bytes());
                 prop_len
-                    .write_at_offset(0, u32::try_from(core::mem::size_of::<TeeUuid>()).unwrap())
+                    .write_at_offset(0, core::mem::size_of::<TeeUuid>().truncate())
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Uuid as u32)
@@ -149,7 +150,7 @@ impl Task {
                     Err(TeeResult::BadParameters)
                 }
             }
-            _ => todo!(),
+            _ => Err(TeeResult::ItemNotFound),
         }
     }
 
@@ -177,7 +178,10 @@ impl Task {
             // (using its UUID) to leverage its functions.
             // TODO: if this TA hasn't been loaded, we need to load its ELF and prepare its stack (hopefully
             // in a separate page table). We can do this here or at `sys_invoke_ta_command` (in a lazy manner).
-            todo!("support inter TA interaction")
+            #[cfg(debug_assertions)]
+            todo!("support inter TA interaction");
+            #[cfg(not(debug_assertions))]
+            Err(TeeResult::NotSupported)
         }
     }
 
@@ -188,7 +192,10 @@ impl Task {
             close_pta_session(ta_sess_id);
             Ok(())
         } else {
-            todo!("support inter TA interaction")
+            #[cfg(debug_assertions)]
+            todo!("support inter TA interaction");
+            #[cfg(not(debug_assertions))]
+            Err(TeeResult::NotSupported)
         }
     }
 
@@ -209,7 +216,10 @@ impl Task {
             // TODO: check whether `ta_sess_id` is associated with the system PTA.
             self.handle_system_pta_command(cmd_id, &params)
         } else {
-            todo!("support inter TA interaction")
+            #[cfg(debug_assertions)]
+            todo!("support inter TA interaction");
+            #[cfg(not(debug_assertions))]
+            Err(TeeResult::NotSupported)
         }
     }
 

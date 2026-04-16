@@ -135,7 +135,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
         let ctx = SyscallContext::from_pt_regs(ctx);
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
-        let dispatcher = match TeeSyscallNr::try_from(sysnr).unwrap_or(TeeSyscallNr::Unknown) {
+        let dispatcher = match TeeSyscallNr::try_from(sysnr).map_err(|_| Errno::ENOSYS)? {
             TeeSyscallNr::Return => SyscallRequest::Return {
                 ret: ctx.syscall_arg(0),
             },
@@ -240,10 +240,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 blen: ctx.syscall_arg(1),
             },
-            TeeSyscallNr::Unknown => {
-                return Err(Errno::ENOSYS);
-            }
-            _ => todo!(),
+            _ => return Err(Errno::ENOSYS),
         };
 
         Ok(dispatcher)
@@ -1131,7 +1128,7 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
     pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
         let ctx = SyscallContext::from_pt_regs(ctx);
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
-        let dispatcher = match LdelfSyscallNr::try_from(sysnr).unwrap_or(LdelfSyscallNr::Unknown) {
+        let dispatcher = match LdelfSyscallNr::try_from(sysnr).map_err(|_| Errno::ENOSYS)? {
             LdelfSyscallNr::Return => LdelfSyscallRequest::Return {
                 ret: ctx.syscall_arg(0),
             },
@@ -1180,7 +1177,7 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 num_bytes: ctx.syscall_arg(1),
             },
-            _ => todo!("implement ldelf syscall number: {}", sysnr),
+            _ => return Err(Errno::ENOSYS),
         };
 
         Ok(dispatcher)
@@ -2050,6 +2047,19 @@ impl OpteeSmcArgs {
         }
     }
 
+    /// Get the shared memory reference and offset for the physical address of `OpteeMsgArgs`.
+    pub fn optee_regd_shm_ref_and_offset(&self) -> Result<(u64, usize), OpteeSmcReturnCode> {
+        // args[1]:args[2] contains the shared memory reference (pointer)
+        // and args[3] contains the offset within that shared memory.
+        if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
+            let shm_ref = (self.args[1] << 32) | self.args[2];
+            let offset = self.args[3];
+            Ok((shm_ref as u64, offset))
+        } else {
+            Err(OpteeSmcReturnCode::EBadAddr)
+        }
+    }
+
     /// Set the return code of an OP-TEE SMC call
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
@@ -2121,6 +2131,7 @@ pub enum OpteeSmcResult<'a> {
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
         rpc_args: Option<Box<OpteeRpcArgs>>,
+        msg_args_phys_addr: u64,
     },
 }
 

@@ -119,11 +119,17 @@ impl Task {
             if let Some(handle) = cryp_state.get_object_handle(false)
                 && tee_obj_map.exists(handle)
             {
+                #[cfg(debug_assertions)]
                 todo!("support two-key algorithms");
+                #[cfg(not(debug_assertions))]
+                return Err(TeeResult::NotSupported);
             }
 
             let Some(cipher) = create_cipher(cryp_state.algorithm(), key, iv) else {
+                #[cfg(debug_assertions)]
                 todo!("implement algorithm {}", cryp_state.algorithm() as u32);
+                #[cfg(not(debug_assertions))]
+                return Err(TeeResult::NotSupported);
             };
             tee_cryp_state_map.set_cipher(state, &cipher)?;
             Ok(())
@@ -165,7 +171,17 @@ impl Task {
             return Err(TeeResult::ShortBuffer);
         }
         if let Some(mut map) = tee_cryp_state_map.get_mut(state) {
-            if let &mut Some(ref mut cipher) = &mut map.get_mut(&state).unwrap().get_mut_cipher() {
+            // Check last_block before applying the cipher so we don't mutate
+            // dst_slice and then return an error.
+            if last_block {
+                #[cfg(debug_assertions)]
+                todo!("support algorithms which have a certain finalization logic");
+                #[cfg(not(debug_assertions))]
+                return Err(TeeResult::NotSupported);
+            }
+            if let Some(state_entry) = map.get_mut(&state)
+                && let Some(cipher) = state_entry.get_mut_cipher()
+            {
                 dst_slice.copy_from_slice(src_slice);
                 match cipher {
                     Cipher::Aes128Ctr(aes128ctr) => {
@@ -179,11 +195,13 @@ impl Task {
                     }
                 }
                 *dst_len = src_slice.len();
+                Ok(())
+            } else {
+                #[cfg(debug_assertions)]
+                todo!("handle unimplemented cipher");
+                #[cfg(not(debug_assertions))]
+                Err(TeeResult::NotImplemented)
             }
-            if last_block {
-                todo!("support algorithms which have a certain finalization logic");
-            }
-            Ok(())
         } else {
             Err(TeeResult::BadParameters)
         }
@@ -247,14 +265,15 @@ impl Task {
     ) -> Result<(), TeeResult> {
         let tee_obj_map = &self.tee_obj_map;
         if attrs.len() > 1 {
+            #[cfg(debug_assertions)]
             todo!("handle multiple attributes");
+            #[cfg(not(debug_assertions))]
+            return Err(TeeResult::NotSupported);
         }
         if !tee_obj_map.exists(obj) {
             return Err(TeeResult::BadState);
         }
-        tee_obj_map
-            .populate(obj, attrs)
-            .map_err(|_| TeeResult::BadParameters)
+        tee_obj_map.populate(obj, attrs)
     }
 
     pub(crate) fn sys_cryp_obj_copy(
