@@ -417,10 +417,18 @@ impl ElfParsedFile {
                 write: (ph.p_flags & elf::abi::PF_W) != 0,
                 execute: (ph.p_flags & elf::abi::PF_X) != 0,
             };
-            let adjusted_vaddr = base_addr + p_vaddr;
+            let adjusted_vaddr = base_addr
+                .checked_add(p_vaddr)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
             let load_start = page_align_down(adjusted_vaddr);
-            let file_end = page_align_up(adjusted_vaddr + p_filesz);
-            let load_end = page_align_up(adjusted_vaddr + p_memsz);
+            let file_end = adjusted_vaddr
+                .checked_add(p_filesz)
+                .map(page_align_up)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let load_end = adjusted_vaddr
+                .checked_add(p_memsz)
+                .map(page_align_up)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
             if file_end > load_start {
                 // Map the file-backed portion.
                 // `p_offset` should be co-aligned with `p_vaddr`. If it is not,
