@@ -922,7 +922,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
-                let rlim = rlim.read_at_offset(0).ok_or(Errno::EINVAL)?;
+                let rlim = rlim.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
             }
             None => None,
@@ -932,7 +932,7 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(old_rlim) = old_rlim {
             old_rlim
                 .write_at_offset(0, old_limit)
-                .ok_or(Errno::EINVAL)?;
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(())
     }
@@ -944,7 +944,7 @@ impl<FS: ShimFS> Task<FS> {
         rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
-        rlim.write_at_offset(0, old_limit).ok_or(Errno::EINVAL)
+        rlim.write_at_offset(0, old_limit).ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `setrlimit`.
@@ -1080,7 +1080,8 @@ impl<FS: ShimFS> Task<FS> {
                 // This is a reasonable default for high-resolution timers
                 Duration::from_nanos(1)
             }
-            _ => unimplemented!(),
+            // Any other clock ID is not supported; return EINVAL as Linux does.
+            _ => return Err(Errno::EINVAL),
         };
 
         res.write(resolution)
@@ -1132,10 +1133,13 @@ impl<FS: ShimFS> Task<FS> {
         tv: Option<crate::MutPtr<litebox_common_linux::TimeVal>>,
         tz: Option<crate::MutPtr<litebox_common_linux::TimeZone>>,
     ) -> Result<(), Errno> {
-        if tz.is_some() {
+        if let Some(tz) = tz {
             // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
-            // should normally be specified as NULL.
-            unimplemented!()
+            // should normally be specified as NULL. Linux still accepts a non-NULL tz and fills it
+            // in (typically with zeros for UTC systems) rather than returning an error.
+            // tz_minuteswest=0 (UTC), tz_dsttime=0 (no DST adjustment)
+            let utc_tz = litebox_common_linux::TimeZone::new(0, 0);
+            tz.write_at_offset(0, utc_tz).ok_or(Errno::EFAULT)?;
         }
         if let Some(tv) = tv {
             tv.write_at_offset(0, self.real_time_as_duration_since_epoch().into())
