@@ -328,7 +328,7 @@ fn test_getdent64() {
     }
     task.sys_close(dir_fd).expect("Failed to close directory");
 
-    // Test 3: Too-small buffer should return EINVAL
+    // Test 3: Too small buffer should return EINVAL
     let dir_fd = task
         .sys_open("/", OFlags::RDONLY, Mode::empty())
         .expect("Failed to open root directory");
