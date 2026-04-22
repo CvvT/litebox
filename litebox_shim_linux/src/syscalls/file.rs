@@ -461,7 +461,30 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                |fd| match files.fs.seek(fd, offset, whence) {
+                    Ok(pos) => Ok(pos),
+                    Err(litebox::fs::errors::SeekError::NotAFile) => {
+                        let base: usize = match whence {
+                            SeekWhence::RelativeToBeginning => 0,
+                            SeekWhence::RelativeToCurrentOffset => self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |off: &Diroff| off.0)
+                                .unwrap_or(0),
+                            SeekWhence::RelativeToEnd => {
+                                return Err(Errno::EINVAL);
+                            }
+                        };
+                        let new_pos = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+                        self.global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, Diroff(new_pos));
+                        Ok(new_pos)
+                    }
+                    Err(e) => Err(Errno::from(e)),
+                },
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
@@ -2071,6 +2094,10 @@ impl<FS: ShimFS> Task<FS> {
                         .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
                     if nbytes + len > count {
                         // not enough space
+                        if nbytes == 0 {
+                            // not enough space for even a single entry
+                            return Err(Errno::EINVAL);
+                        }
                         break;
                     }
                     let dirent64 = litebox_common_linux::LinuxDirent64 {
@@ -2106,11 +2133,11 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
-            |_fd| todo!("net"),
-            |_fd| todo!("pipes"),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
         )?
     }
 }
