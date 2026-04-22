@@ -600,6 +600,34 @@ impl RawDescriptorStorage {
         ret
     }
 
+    /// Get a raw integer value in `[min_idx, max_idx)` for the provided `fd`.
+    ///
+    /// Returns the inserted raw integer FD on success, otherwise returns back `fd` unchanged.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics are only within assertions"
+    )]
+    pub fn fd_into_raw_integer_in_range<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+        min_idx: usize,
+        max_idx: usize,
+    ) -> Result<usize, TypedFd<Subsystem>> {
+        let idx = self
+            .stored_fds
+            .iter()
+            .skip(min_idx)
+            .position(Option::is_none)
+            .map_or_else(|| self.stored_fds.len().max(min_idx), |pos| pos + min_idx);
+
+        if idx >= max_idx {
+            return Err(fd);
+        }
+        let success = self.fd_into_specific_raw_integer(fd, idx);
+        assert!(success);
+        Ok(idx)
+    }
+
     /// Store the provided `fd` at the provided _specific_ raw integer FD.
     ///
     /// This is similar to [`Self::fd_into_raw_integer`] except that it specifies a specific FD to

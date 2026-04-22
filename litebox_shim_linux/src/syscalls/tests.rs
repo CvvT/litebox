@@ -94,6 +94,25 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    // Test F_DUPFD allocates at or above `min_fd`.
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open /dev/stdin");
+    let fd = i32::try_from(fd).unwrap();
+    let stdout_stat = task.sys_fstat(1).unwrap();
+    let min_fd = u32::try_from(fd + 2).unwrap();
+    let duplicated = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd,
+            },
+        )
+        .expect("F_DUPFD should succeed for free slots at/above min_fd");
+    assert_eq!(duplicated, min_fd);
+    assert_eq!(stdout_stat, task.sys_fstat(1).unwrap());
 }
 
 #[test]

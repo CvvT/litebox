@@ -1195,14 +1195,6 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let new_file = self.do_dup(
-                    desc,
-                    if cloexec {
-                        OFlags::CLOEXEC
-                    } else {
-                        OFlags::empty()
-                    },
-                )?;
                 let max_fd = self
                     .process()
                     .limits
@@ -1210,10 +1202,16 @@ impl<FS: ShimFS> Task<FS> {
                 if min_fd as usize >= max_fd {
                     return Err(Errno::EINVAL);
                 }
-                if new_file < min_fd as usize || new_file > max_fd {
-                    self.do_close(new_file)?;
-                    return Err(Errno::EMFILE);
-                }
+                let new_file = self.do_dup_in_range(
+                    desc,
+                    if cloexec {
+                        OFlags::CLOEXEC
+                    } else {
+                        OFlags::empty()
+                    },
+                    min_fd as usize,
+                    max_fd,
+                )?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -1920,6 +1918,51 @@ impl<FS: ShimFS> Task<FS> {
 
     fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
         self.do_dup_inner(file, flags, None)
+    }
+
+    fn do_dup_in_range(
+        &self,
+        file: usize,
+        flags: OFlags,
+        min_fd: usize,
+        max_fd: usize,
+    ) -> Result<usize, Errno> {
+        fn dup_in_range<FS: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalState<FS>,
+            files: &FilesState<FS>,
+            fd: &TypedFd<S>,
+            close_on_exec: bool,
+            min_fd: usize,
+            max_fd: usize,
+        ) -> Result<usize, Errno> {
+            let mut dt = global.litebox.descriptor_table_mut();
+            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+            if close_on_exec {
+                let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
+            }
+            let mut rds = files.raw_descriptor_store.write();
+            match rds.fd_into_raw_integer_in_range(fd, min_fd, max_fd) {
+                Ok(new_fd) => Ok(new_fd),
+                Err(fd) => {
+                    let old = dt.remove(&fd);
+                    assert!(old.is_some());
+                    Err(Errno::EMFILE)
+                }
+            }
+        }
+
+        let close_on_exec = flags.contains(OFlags::CLOEXEC);
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            file,
+            |fd| dup_in_range(&self.global, &files, fd, close_on_exec, min_fd, max_fd),
+            |fd| dup_in_range(&self.global, &files, fd, close_on_exec, min_fd, max_fd),
+            |fd| dup_in_range(&self.global, &files, fd, close_on_exec, min_fd, max_fd),
+            |fd| dup_in_range(&self.global, &files, fd, close_on_exec, min_fd, max_fd),
+            |fd| dup_in_range(&self.global, &files, fd, close_on_exec, min_fd, max_fd),
+            |fd| dup_in_range(&self.global, &files, fd, close_on_exec, min_fd, max_fd),
+        )?
     }
 
     fn do_dup_inner(
