@@ -1927,6 +1927,7 @@ impl<FS: ShimFS> Task<FS> {
         min_fd: usize,
         max_fd: usize,
     ) -> Result<usize, Errno> {
+        /// Duplicate a typed FD and store the raw integer result within `[min_fd, max_fd)`.
         fn dup_in_range<FS: ShimFS, S: FdEnabledSubsystem>(
             global: &GlobalState<FS>,
             files: &FilesState<FS>,

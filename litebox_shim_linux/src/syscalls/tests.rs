@@ -100,7 +100,7 @@ fn test_fcntl() {
         .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
         .expect("Failed to open /dev/stdin");
     let fd = i32::try_from(fd).unwrap();
-    let stdout_stat = task.sys_fstat(1).unwrap();
+    let stdout_stat_before_dupfd = task.sys_fstat(1).unwrap();
     let min_fd = u32::try_from(fd + 2).unwrap();
     let duplicated = task
         .sys_fcntl(
@@ -112,7 +112,7 @@ fn test_fcntl() {
         )
         .expect("F_DUPFD should succeed for free slots at/above min_fd");
     assert_eq!(duplicated, min_fd);
-    assert_eq!(stdout_stat, task.sys_fstat(1).unwrap());
+    assert_eq!(stdout_stat_before_dupfd, task.sys_fstat(1).unwrap());
 }
 
 #[test]

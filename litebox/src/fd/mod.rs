@@ -613,11 +613,14 @@ impl RawDescriptorStorage {
         min_idx: usize,
         max_idx: usize,
     ) -> Result<usize, TypedFd<Subsystem>> {
-        let idx = self
+        let relative_position = self
             .stored_fds
             .iter()
             .skip(min_idx)
-            .position(Option::is_none)
+            .position(Option::is_none);
+        // If there are no free slots >= `min_idx`, we must allocate at `min_idx` (if beyond
+        // current length) or append to the end.
+        let idx = relative_position
             .map_or_else(|| self.stored_fds.len().max(min_idx), |pos| pos + min_idx);
 
         if idx >= max_idx {
