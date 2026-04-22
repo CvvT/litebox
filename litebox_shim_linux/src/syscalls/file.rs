@@ -249,8 +249,8 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -2070,6 +2070,9 @@ impl<FS: ShimFS> Task<FS> {
                     let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
                         .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
                     if nbytes + len > count {
+                        if nbytes == 0 {
+                            return Err(Errno::EINVAL);
+                        }
                         // not enough space
                         break;
                     }
