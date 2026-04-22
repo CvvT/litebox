@@ -94,6 +94,26 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    // Test fcntl with DUPFD
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let fd = i32::try_from(fd).unwrap();
+
+    let min_fd = fd + 10;
+    let duplicated = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd: u32::try_from(min_fd).unwrap(),
+            },
+        )
+        .unwrap();
+    let duplicated = i32::try_from(duplicated).unwrap();
+
+    assert_eq!(duplicated, min_fd);
 }
 
 #[test]
