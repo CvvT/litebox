@@ -461,7 +461,30 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                |fd| match files.fs.seek(fd, offset, whence) {
+                    Ok(pos) => Ok(pos),
+                    Err(litebox::fs::errors::SeekError::NotAFile) => {
+                        let base: usize = match whence {
+                            SeekWhence::RelativeToBeginning => 0,
+                            SeekWhence::RelativeToCurrentOffset => self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |off: &Diroff| off.0)
+                                .unwrap_or(0),
+                            SeekWhence::RelativeToEnd => {
+                                return Err(Errno::EINVAL);
+                            }
+                        };
+                        let new_pos = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+                        self.global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, Diroff(new_pos));
+                        Ok(new_pos)
+                    }
+                    Err(e) => Err(Errno::from(e)),
+                },
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
@@ -1195,14 +1218,6 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let new_file = self.do_dup(
-                    desc,
-                    if cloexec {
-                        OFlags::CLOEXEC
-                    } else {
-                        OFlags::empty()
-                    },
-                )?;
                 let max_fd = self
                     .process()
                     .limits
@@ -1210,10 +1225,15 @@ impl<FS: ShimFS> Task<FS> {
                 if min_fd as usize >= max_fd {
                     return Err(Errno::EINVAL);
                 }
-                if new_file < min_fd as usize || new_file > max_fd {
-                    self.do_close(new_file)?;
-                    return Err(Errno::EMFILE);
-                }
+                let new_file = self.do_dup_inner(
+                    desc,
+                    if cloexec {
+                        OFlags::CLOEXEC
+                    } else {
+                        OFlags::empty()
+                    },
+                    DupFdRequest::LowestAtOrAbove(min_fd as usize),
+                )?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -1919,21 +1939,21 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
-        self.do_dup_inner(file, flags, None)
+        self.do_dup_inner(file, flags, DupFdRequest::LowestAvailable)
     }
 
     fn do_dup_inner(
         &self,
         file: usize,
         flags: OFlags,
-        target: Option<usize>,
+        target: DupFdRequest,
     ) -> Result<usize, Errno> {
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
             global: &GlobalState<FS>,
             files: &FilesState<FS>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
-            target: Option<usize>,
+            target: DupFdRequest,
         ) -> Result<usize, Errno> {
             let mut dt = global.litebox.descriptor_table_mut();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
@@ -1942,13 +1962,26 @@ impl<FS: ShimFS> Task<FS> {
                 assert!(old.is_none());
             }
             let mut rds = files.raw_descriptor_store.write();
-            if let Some(target) = target {
-                if !rds.fd_into_specific_raw_integer(fd, target) {
-                    return Err(Errno::EBADF);
+            match target {
+                DupFdRequest::Exact(target) => {
+                    if !rds.fd_into_specific_raw_integer(fd, target) {
+                        return Err(Errno::EBADF);
+                    }
+                    Ok(target)
                 }
-                Ok(target)
-            } else {
-                Ok(rds.fd_into_raw_integer(fd))
+                DupFdRequest::LowestAvailable => Ok(rds.fd_into_raw_integer(fd)),
+                DupFdRequest::LowestAtOrAbove(min_fd) => {
+                    let mut raw_fd = min_fd;
+                    for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
+                        if occupied_raw_fd != raw_fd {
+                            break;
+                        }
+                        raw_fd += 1;
+                    }
+                    let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
+                    assert!(success);
+                    Ok(raw_fd)
+                }
             }
         }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
@@ -1962,7 +1995,10 @@ impl<FS: ShimFS> Task<FS> {
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
         )??;
-        if target.is_none() {
+        if matches!(
+            target,
+            DupFdRequest::LowestAvailable | DupFdRequest::LowestAtOrAbove(_)
+        ) {
             let max_fd = self
                 .process()
                 .limits
@@ -2021,7 +2057,7 @@ impl<FS: ShimFS> Task<FS> {
             self.do_dup_inner(
                 oldfd_usize,
                 flags.unwrap_or(OFlags::empty()),
-                Some(newfd_usize),
+                DupFdRequest::Exact(newfd_usize),
             )?;
             Ok(newfd)
         } else {
@@ -2030,6 +2066,13 @@ impl<FS: ShimFS> Task<FS> {
             Ok(u32::try_from(new_file).unwrap())
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum DupFdRequest {
+    LowestAvailable,
+    LowestAtOrAbove(usize),
+    Exact(usize),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2071,6 +2114,10 @@ impl<FS: ShimFS> Task<FS> {
                         .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
                     if nbytes + len > count {
                         // not enough space
+                        if nbytes == 0 {
+                            // not enough space for even a single entry
+                            return Err(Errno::EINVAL);
+                        }
                         break;
                     }
                     let dirent64 = litebox_common_linux::LinuxDirent64 {
@@ -2106,11 +2153,11 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
-            |_fd| todo!("net"),
-            |_fd| todo!("pipes"),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
         )?
     }
 }

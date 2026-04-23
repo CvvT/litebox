@@ -34,25 +34,6 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rewrite_syscalls: bool,
-    /// Choice of interception backend
-    #[arg(
-        value_enum,
-        long = "interception-backend",
-        requires = "unstable",
-        help_heading = "Unstable Options",
-        default_value = "rewriter"
-    )]
-    pub interception_backend: InterceptionBackend,
-}
-
-/// Backends supported for intercepting syscalls
-#[non_exhaustive]
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum InterceptionBackend {
-    /// Use seccomp-based syscall interception
-    Seccomp,
-    /// Depend purely on rewriten syscalls to intercept them
-    Rewriter,
 }
 
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
@@ -94,19 +75,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    //
-    // TODO: We also need to pick the type of syscall interception based on whether we want
-    // systrap/sigsys interception, or binary rewriting interception. Currently
-    // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
     let _litebox = shim_builder.litebox();
     let shim = shim_builder.build();
-    match cli_args.interception_backend {
-        InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {}
-    }
 
     if cli_args.command_sequence.is_empty() {
         run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());

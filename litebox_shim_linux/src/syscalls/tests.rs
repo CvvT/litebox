@@ -94,6 +94,26 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    // Test fcntl with DUPFD
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let fd = i32::try_from(fd).unwrap();
+
+    let min_fd = fd + 10;
+    let duplicated = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd: u32::try_from(min_fd).unwrap(),
+            },
+        )
+        .unwrap();
+    let duplicated = i32::try_from(duplicated).unwrap();
+
+    assert_eq!(duplicated, min_fd);
 }
 
 #[test]
@@ -327,7 +347,11 @@ fn test_getdent64() {
 
     // Test 5: Zero-length buffer
     let result = task.sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
-    assert_eq!(result, Ok(0), "Should return 0 for zero-length buffer");
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Should return EINVAL for zero-length buffer"
+    );
 
     task.sys_close(dir_fd).expect("Failed to close directory");
 
