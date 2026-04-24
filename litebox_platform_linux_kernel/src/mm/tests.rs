@@ -16,7 +16,10 @@ use litebox::{
             PageRange, VmFlags,
         },
     },
-    platform::RawConstPointer,
+    platform::{
+        PageManagementProvider, RawConstPointer,
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+    },
 };
 use spin::mutex::SpinMutex;
 
@@ -209,6 +212,39 @@ fn test_page_table() {
             pgtable.translate(VirtAddr::new(page as _)),
             TranslateResult::NotMapped
         ));
+    }
+}
+
+#[test]
+fn test_platform_remap_adjacent_ranges_are_allowed() {
+    let start_addr: usize = 0x3_0000;
+    let old_range = start_addr..(start_addr + 2 * PAGE_SIZE);
+    let new_range = old_range.end..(old_range.end + old_range.len());
+    let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
+    let platform = MockKernel::new(p4.start_address());
+    let permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+
+    unsafe {
+        assert!(
+            <MockKernel as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+                platform,
+                old_range.clone(),
+                permissions,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace
+            )
+            .is_ok()
+        );
+        assert!(
+            <MockKernel as PageManagementProvider<PAGE_SIZE>>::remap_pages(
+                platform,
+                old_range,
+                new_range,
+                permissions
+            )
+            .is_ok()
+        );
     }
 }
 
