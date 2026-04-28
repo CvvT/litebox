@@ -306,6 +306,9 @@ impl<FS: ShimFS> Task<FS> {
                         .map_err(Errno::from)
                 },
                 |fd| {
+                    if offset.is_some() {
+                        return Err(Errno::ESPIPE);
+                    }
                     self.global.receive(
                         &self.wait_cx(),
                         fd,
@@ -315,6 +318,9 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 },
                 |fd| {
+                    if offset.is_some() {
+                        return Err(Errno::ESPIPE);
+                    }
                     self.global
                         .pipes
                         .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
@@ -339,6 +345,9 @@ impl<FS: ShimFS> Task<FS> {
                 },
                 |_fd| Err(Errno::EINVAL),
                 |fd| {
+                    if offset.is_some() {
+                        return Err(Errno::ESPIPE);
+                    }
                     let handle = self
                         .global
                         .litebox
@@ -372,6 +381,9 @@ impl<FS: ShimFS> Task<FS> {
                 raw_fd,
                 |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
                 |fd| {
+                    if offset.is_some() {
+                        return Err(Errno::ESPIPE);
+                    }
                     self.global.sendto(
                         &self.wait_cx(),
                         fd,
@@ -381,6 +393,9 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 },
                 |fd| {
+                    if offset.is_some() {
+                        return Err(Errno::ESPIPE);
+                    }
                     self.global
                         .pipes
                         .write(&self.wait_cx(), fd, buf)
@@ -407,6 +422,9 @@ impl<FS: ShimFS> Task<FS> {
                 },
                 |_fd| Err(Errno::EINVAL),
                 |fd| {
+                    if offset.is_some() {
+                        return Err(Errno::ESPIPE);
+                    }
                     let handle = self
                         .global
                         .litebox
@@ -581,14 +599,17 @@ impl<FS: ShimFS> Task<FS> {
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let mut total_read = 0;
-        let mut kernel_buffer = vec![
-            0u8;
-            iovs.iter()
-                .map(|i| i.iov_len)
-                .max()
-                .unwrap_or_default()
-                .min(super::super::MAX_KERNEL_BUF_SIZE)
-        ];
+        // We need to do this cell dance because otherwise Rust can't recognize that the
+        // closures are mutually exclusive.
+        let kernel_buffer: core::cell::RefCell<alloc::vec::Vec<u8>> =
+            core::cell::RefCell::new(vec![
+                0u8;
+                iovs.iter()
+                    .map(|i| i.iov_len)
+                    .max()
+                    .unwrap_or_default()
+                    .min(super::super::MAX_KERNEL_BUF_SIZE)
+            ]);
         for iov in iovs {
             if iov.iov_len == 0 {
                 continue;
@@ -596,6 +617,7 @@ impl<FS: ShimFS> Task<FS> {
             let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
                 return Err(Errno::EINVAL);
             };
+            let iov_len = iov.iov_len;
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
             // output from writes in other processes
@@ -603,20 +625,70 @@ impl<FS: ShimFS> Task<FS> {
                 .run_on_raw_fd(
                     raw_fd,
                     |fd| {
-                        files
-                            .fs
-                            .read(fd, &mut kernel_buffer, None)
+                        let mut kbuf = kernel_buffer.borrow_mut();
+                        files.fs.read(fd, &mut *kbuf, None).map_err(Errno::from)
+                    },
+                    |fd| {
+                        let mut kbuf = kernel_buffer.borrow_mut();
+                        let len = iov_len.min(kbuf.len());
+                        self.global.receive(
+                            &self.wait_cx(),
+                            fd,
+                            &mut kbuf[..len],
+                            litebox_common_linux::ReceiveFlags::empty(),
+                            None,
+                        )
+                    },
+                    |fd| {
+                        let mut kbuf = kernel_buffer.borrow_mut();
+                        let len = iov_len.min(kbuf.len());
+                        self.global
+                            .pipes
+                            .read(&self.wait_cx(), fd, &mut kbuf[..len])
                             .map_err(Errno::from)
                     },
-                    |_fd| todo!("net"),
-                    |_fd| todo!("pipes"),
-                    |_fd| todo!("eventfd"),
+                    |fd| {
+                        if iov_len < core::mem::size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let value = file.read(&self.wait_cx())?;
+                            let mut kbuf = kernel_buffer.borrow_mut();
+                            kbuf[..core::mem::size_of::<u64>()]
+                                .copy_from_slice(&value.to_le_bytes());
+                            Ok(core::mem::size_of::<u64>())
+                        })
+                    },
                     |_fd| Err(Errno::EINVAL),
-                    |_fd| todo!("unix"),
+                    |fd| {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let mut kbuf = kernel_buffer.borrow_mut();
+                            let len = iov_len.min(kbuf.len());
+                            file.recvfrom(
+                                &self.wait_cx(),
+                                &mut kbuf[..len],
+                                litebox_common_linux::ReceiveFlags::empty(),
+                                None,
+                            )
+                        })
+                    },
                 )
                 .flatten()?;
+            let kbuf = kernel_buffer.borrow();
             iov.iov_base
-                .copy_from_slice(0, &kernel_buffer[..size])
+                .copy_from_slice(0, &kbuf[..size])
                 .ok_or(Errno::EFAULT)?;
             total_read += size;
             if size < iov.iov_len {
@@ -687,10 +759,49 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
-                |_fd| todo!("pipes"),
-                |_fd| todo!("eventfd"),
+                |fd| {
+                    write_to_iovec(iovs, |buf| {
+                        self.global
+                            .pipes
+                            .write(&self.wait_cx(), fd, buf)
+                            .map_err(Errno::from)
+                    })
+                },
+                |fd| {
+                    write_to_iovec(iovs, |buf| {
+                        if buf.len() < core::mem::size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let value: u64 = u64::from_le_bytes(
+                                buf[..core::mem::size_of::<u64>()]
+                                    .try_into()
+                                    .map_err(|_| Errno::EINVAL)?,
+                            );
+                            file.write(&self.wait_cx(), value)
+                        })
+                    })
+                },
                 |_fd| Err(Errno::EINVAL),
-                |_fd| todo!("unix"),
+                |fd| {
+                    write_to_iovec(iovs, |buf| {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                        })
+                    })
+                },
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -743,7 +854,22 @@ impl<FS: ShimFS> Task<FS> {
                 0 => return Ok("/dev/stdin".to_string()),
                 1 => return Ok("/dev/stdout".to_string()),
                 2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
+                _ => {
+                    // Check whether the fd is open; return EBADF if not.
+                    let fd_usize = fd as usize;
+                    if !self
+                        .files
+                        .borrow()
+                        .raw_descriptor_store
+                        .read()
+                        .is_alive(fd_usize)
+                    {
+                        return Err(Errno::EBADF);
+                    }
+                    // LiteBox does not track the original open path per fd yet;
+                    // return ENOENT as a conservative fallback rather than panicking.
+                    return Err(Errno::ENOENT);
+                }
             }
         }
 
@@ -773,7 +899,7 @@ impl<FS: ShimFS> Task<FS> {
                 let cwd = self.fs.borrow().cwd.read().clone();
                 self.do_readlink(&cwd)
             }
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => Err(Errno::ENOENT),
         }?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
@@ -2167,6 +2293,7 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use litebox::fs::Mode;
+    use litebox_common_linux::{IoReadVec, IoWriteVec};
 
     extern crate std;
 
@@ -2353,6 +2480,169 @@ mod tests {
         assert_eq!(
             task.sys_stat("/cwd_test/subdir").unwrap_err(),
             Errno::ENOENT
+        );
+    }
+
+    /// Gap 1: pread64 / pwrite64 must return ESPIPE for non-seekable fds (pipes).
+    #[test]
+    fn test_pread_pwrite_espipe_on_pipe() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let (read_fd, write_fd) = task
+            .sys_pipe2(litebox::fs::OFlags::NONBLOCK)
+            .expect("Failed to create pipe");
+        let read_fd = i32::try_from(read_fd).unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+
+        // Seed the pipe so a read wouldn't block.
+        task.sys_write(write_fd, b"hello", None)
+            .expect("Failed to seed pipe");
+
+        // pread64 on the read-end of a pipe must return ESPIPE.
+        assert_eq!(
+            task.sys_pread64(read_fd, &mut [0u8; 8], 0),
+            Err(Errno::ESPIPE),
+            "pread64 on pipe read-end should return ESPIPE"
+        );
+
+        // pread64 on the write-end of a pipe must also return ESPIPE.
+        assert_eq!(
+            task.sys_pread64(write_fd, &mut [0u8; 8], 0),
+            Err(Errno::ESPIPE),
+            "pread64 on pipe write-end should return ESPIPE"
+        );
+
+        // pwrite64 on the write-end of a pipe must return ESPIPE.
+        assert_eq!(
+            task.sys_pwrite64(write_fd, b"data", 0),
+            Err(Errno::ESPIPE),
+            "pwrite64 on pipe write-end should return ESPIPE"
+        );
+
+        // pwrite64 on the read-end of a pipe must also return ESPIPE.
+        assert_eq!(
+            task.sys_pwrite64(read_fd, b"data", 0),
+            Err(Errno::ESPIPE),
+            "pwrite64 on pipe read-end should return ESPIPE"
+        );
+
+        task.sys_close(read_fd).expect("Failed to close read_fd");
+        task.sys_close(write_fd).expect("Failed to close write_fd");
+    }
+
+    /// Gap 2: readv / writev must work on pipes without panicking.
+    #[test]
+    fn test_readv_writev_pipe() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let (read_fd, write_fd) = task
+            .sys_pipe2(litebox::fs::OFlags::empty())
+            .expect("Failed to create pipe");
+        let read_fd = i32::try_from(read_fd).unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+
+        let part1: &[u8] = b"hello ";
+        let part2: &[u8] = b"world";
+
+        // writev two buffers into the write-end.
+        let iovs_write = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(part1.as_ptr() as usize),
+                iov_len: part1.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(part2.as_ptr() as usize),
+                iov_len: part2.len(),
+            },
+        ];
+        let total_written = task
+            .sys_writev(
+                write_fd,
+                ConstPtr::from_usize(iovs_write.as_ptr() as usize),
+                iovs_write.len(),
+            )
+            .expect("writev on pipe failed");
+        assert_eq!(
+            total_written,
+            part1.len() + part2.len(),
+            "writev should write all bytes"
+        );
+        task.sys_close(write_fd).expect("Failed to close write_fd");
+
+        // readv the data back from the read-end.
+        let mut buf1 = [0u8; 6];
+        let mut buf2 = [0u8; 5];
+        let iovs_read = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(buf1.as_mut_ptr() as usize),
+                iov_len: buf1.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(buf2.as_mut_ptr() as usize),
+                iov_len: buf2.len(),
+            },
+        ];
+        let total_read = task
+            .sys_readv(
+                read_fd,
+                ConstPtr::from_usize(iovs_read.as_ptr() as usize),
+                iovs_read.len(),
+            )
+            .expect("readv on pipe failed");
+        assert_eq!(total_read, total_written, "readv should read all bytes");
+        assert_eq!(&buf1, b"hello ", "first buffer mismatch");
+        assert_eq!(&buf2, b"world", "second buffer mismatch");
+
+        task.sys_close(read_fd).expect("Failed to close read_fd");
+    }
+
+    /// Gap 3: do_readlink for /proc/self/fd/<n> must not panic for n > 2.
+    #[test]
+    fn test_readlink_proc_fd() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // stdin / stdout / stderr must resolve correctly.
+        let mut buf = [0u8; 256];
+        let len = task
+            .sys_readlink("/proc/self/fd/0", &mut buf)
+            .expect("readlink /proc/self/fd/0 should succeed");
+        assert_eq!(&buf[..len], b"/dev/stdin");
+
+        let len = task
+            .sys_readlink("/proc/self/fd/1", &mut buf)
+            .expect("readlink /proc/self/fd/1 should succeed");
+        assert_eq!(&buf[..len], b"/dev/stdout");
+
+        let len = task
+            .sys_readlink("/proc/self/fd/2", &mut buf)
+            .expect("readlink /proc/self/fd/2 should succeed");
+        assert_eq!(&buf[..len], b"/dev/stderr");
+
+        // Open a regular file to get an fd > 2.
+        let fd = task
+            .sys_open(
+                "/test_readlink_procfd.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("Failed to open test file");
+        let fd_i32 = i32::try_from(fd).unwrap();
+
+        // readlink on an open fd > 2 should return ENOENT (path not tracked yet),
+        // not panic.
+        let procpath = alloc::format!("/proc/self/fd/{fd}");
+        assert_eq!(
+            task.sys_readlink(procpath.as_str(), &mut buf),
+            Err(Errno::ENOENT),
+            "readlink on open fd > 2 should return ENOENT, not panic"
+        );
+
+        // After closing the fd, readlink should return EBADF.
+        task.sys_close(fd_i32).expect("Failed to close fd");
+        assert_eq!(
+            task.sys_readlink(procpath.as_str(), &mut buf),
+            Err(Errno::EBADF),
+            "readlink on closed fd should return EBADF"
         );
     }
 }
